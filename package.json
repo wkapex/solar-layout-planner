@@ -1,0 +1,21 @@
+{
+  "name": "solar-layout-planner",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "敷地図（公図・設計平面図・航空写真）から野立て太陽光パネル配置平面図を自動生成しDXF出力するツール",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^4.7.76",
+    "suncalc": "^1.9.0"
+  },
+  "devDependencies": {
+    "@types/suncalc": "^1.9.2",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
