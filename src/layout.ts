@@ -400,7 +400,24 @@ export function layoutFlushRoof(input: LayoutInput): LayoutResult {
   type Best = { facing: number; u0: number; v0: number; r0: number; c0: number; h: number; w: number; count: number };
   let best: Best | null = null;
 
-  for (const facing of candidateFacingsRoof(input)) {
+  // 【絶対条件】常に横置き：パネル長辺(u軸)が画面で水平寄り（|x|≥|y|）の向きのみ採用する。
+  // u軸 = dirFromBearing(facing+90)。屋根が回転していても、より水平な屋根辺に長辺を沿わせる。
+  const allFacings = candidateFacingsRoof(input);
+  const uHoriz = (f: number) => {
+    const u = dirFromBearing(f + 90, n, e);
+    return Math.abs(u.x) >= Math.abs(u.y);
+  };
+  let facings = allFacings.filter(uHoriz);
+  if (facings.length === 0) {
+    // どの辺も水平寄りにならない場合は、最も水平に近い向きを1つ採用
+    facings = [
+      allFacings.reduce((b, f) =>
+        Math.abs(dirFromBearing(f + 90, n, e).x) > Math.abs(dirFromBearing(b + 90, n, e).x) ? f : b
+      ),
+    ];
+  }
+
+  for (const facing of facings) {
     const uUnit = dirFromBearing(facing + 90, n, e);
     const vUnit = dirFromBearing((facing + 180) % 360, n, e);
     const toWorld = (u: number, v: number): Vec2 => add(scale(uUnit, u), scale(vUnit, v));
