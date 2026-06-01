@@ -7,6 +7,7 @@ import {
   dot,
   projectRange,
   rectInsideWithSetback,
+  pointInPolygon,
 } from "./geometry";
 import type { PanelSpec } from "./panels";
 import { moduleDimsM } from "./panels";
@@ -37,6 +38,8 @@ export interface LayoutInput {
   mountainGapM?: number; // rack時の山と山の離隔（既定0.25m）
   flushRows?: number; // flush時の手動指定: 縦(段数=南北方向の枚数)。空欄=自動最大
   flushCols?: number; // flush時の手動指定: 横(列数=東西方向の枚数)。空欄=自動最大
+  setbackEWm?: number; // flush時の東西(列方向)の屋根端離隔。未指定はsetbackM
+  setbackNSm?: number; // flush時の南北(行方向)の屋根端離隔。未指定はsetbackM
 }
 
 export interface ArrayTable {
@@ -388,6 +391,11 @@ export function layoutFlushRoof(input: LayoutInput): LayoutResult {
   const cellU = longM + input.colGapM;
   const cellV = shortM + (input.rowGapM ?? 0.02);
   const CAP = 60000; // セル数の安全弁
+  // 屋根端離隔（東西/南北 個別）。未指定は一律 setbackM。
+  const sEW = input.setbackEWm ?? input.setbackM;
+  const sNS = input.setbackNSm ?? input.setbackM;
+  const EPS = 1e-4;
+  const FRAC = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 
   type Best = { facing: number; u0: number; v0: number; r0: number; c0: number; h: number; w: number; count: number };
   let best: Best | null = null;
@@ -398,11 +406,24 @@ export function layoutFlushRoof(input: LayoutInput): LayoutResult {
     const toWorld = (u: number, v: number): Vec2 => add(scale(uUnit, u), scale(vUnit, v));
     const uR = projectRange(input.polygonM, uUnit);
     const vR = projectRange(input.polygonM, vUnit);
+    // 1パネルを東西sEW・南北sNSだけ拡げた矩形が屋根内に収まるか（方向別離隔）
+    const cellFits = (u: number, v: number): boolean => {
+      const c = [
+        toWorld(u - sEW, v - sNS),
+        toWorld(u + panelU + sEW, v - sNS),
+        toWorld(u + panelU + sEW, v + panelV + sNS),
+        toWorld(u - sEW, v + panelV + sNS),
+      ];
+      return c.every((p) => pointInPolygon(p, input.polygonM));
+    };
 
-    for (const pu of [0, 0.5]) {
-      for (const pv of [0, 0.5]) {
-        const u0 = uR.min + pu * cellU;
-        const v0 = vR.min + pv * cellV;
+    // 位置候補: 屋根端に寄せる「左詰め/上詰めアンカー」＋粗い位相。
+    // アンカーにより、収まる最大列数/段数を確実に拾う。
+    const u0List = [uR.min + sEW + EPS, ...FRAC.map((f) => uR.min + f * cellU)];
+    const v0List = [vR.min + sNS + EPS, ...FRAC.map((f) => vR.min + f * cellV)];
+
+    for (const u0 of u0List) {
+      for (const v0 of v0List) {
         const ncols = Math.floor((uR.max - u0 - panelU) / cellU) + 1;
         const nrows = Math.floor((vR.max - v0 - panelV) / cellV) + 1;
         if (ncols < 1 || nrows < 1 || ncols * nrows > CAP) continue;
@@ -411,16 +432,7 @@ export function layoutFlushRoof(input: LayoutInput): LayoutResult {
         for (let j = 0; j < nrows; j++) {
           const row: boolean[] = [];
           const v = v0 + j * cellV;
-          for (let i = 0; i < ncols; i++) {
-            const u = u0 + i * cellU;
-            const corners = [
-              toWorld(u, v),
-              toWorld(u + panelU, v),
-              toWorld(u + panelU, v + panelV),
-              toWorld(u, v + panelV),
-            ];
-            row.push(rectInsideWithSetback(corners, input.polygonM, input.setbackM));
-          }
+          for (let i = 0; i < ncols; i++) row.push(cellFits(u0 + i * cellU, v));
           valid.push(row);
         }
 

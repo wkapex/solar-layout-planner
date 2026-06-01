@@ -447,6 +447,8 @@ el("generateBtn").addEventListener("click", () => {
     mountainGapM: parseFloat(inp("mountainGap").value) || 0.25,
     flushRows: parseInt(inp("flushRows").value) || undefined,
     flushCols: parseInt(inp("flushCols").value) || undefined,
+    setbackEWm: parseFloat(inp("flushSetbackEW").value) || 0,
+    setbackNSm: parseFloat(inp("flushSetbackNS").value) || 0,
   };
 
   status("配置を計算中...");
