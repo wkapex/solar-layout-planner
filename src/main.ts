@@ -11,6 +11,7 @@ import {
   layoutPatternA,
   layoutPatternB,
   layoutRoofSingle,
+  layoutFlushRoof,
   LayoutInput,
   LayoutResult,
   ColumnMode,
@@ -444,6 +445,8 @@ el("generateBtn").addEventListener("click", () => {
     mountType,
     rowGapM: parseFloat(inp("roofRowGap").value) || 0.02,
     mountainGapM: parseFloat(inp("mountainGap").value) || 0.25,
+    flushRows: parseInt(inp("flushRows").value) || undefined,
+    flushCols: parseInt(inp("flushCols").value) || undefined,
   };
 
   status("配置を計算中...");
@@ -451,7 +454,9 @@ el("generateBtn").addEventListener("click", () => {
     const list: LayoutResult[] =
       mountType === "tilted"
         ? [layoutPatternA(input), layoutPatternB(input)]
-        : [layoutRoofSingle(input)];
+        : mountType === "rack"
+          ? [layoutRoofSingle(input)]
+          : [layoutFlushRoof(input)];
     showResults(list);
     status("生成完了: " + list.map((r) => `${patternLabel(r)}=${r.totalPanels}枚(${r.totalKw.toFixed(1)}kW)`).join(" / "));
   }, 20);

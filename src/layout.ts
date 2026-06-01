@@ -35,6 +35,8 @@ export interface LayoutInput {
   mountType: "tilted" | "rack" | "flush";
   rowGapM?: number; // flush時の行間ギャップ（既定0.02m）
   mountainGapM?: number; // rack時の山と山の離隔（既定0.25m）
+  flushRows?: number; // flush時の手動指定: 縦(段数=南北方向の枚数)。空欄=自動最大
+  flushCols?: number; // flush時の手動指定: 横(列数=東西方向の枚数)。空欄=自動最大
 }
 
 export interface ArrayTable {
@@ -333,7 +335,7 @@ function candidateFacingsRoof(input: LayoutInput): number[] {
   return [...set];
 }
 
-/** 屋根（傾斜屋根フラッシュ／陸屋根合掌）：屋根なりに密に配置し、枚数最大の向きを採用 */
+/** 陸屋根（合掌）：屋根なりに密に配置し、枚数最大の向きを採用 */
 export function layoutRoofSingle(input: LayoutInput): LayoutResult {
   let best: { facing: number; placed: ReturnType<typeof placeArrays>; panels: number } | null =
     null;
@@ -343,4 +345,134 @@ export function layoutRoofSingle(input: LayoutInput): LayoutResult {
     if (!best || panels > best.panels) best = { facing, placed, panels };
   }
   return buildResult("ROOF", input, best!.facing, best!.placed);
+}
+
+/** 2値行列内の「全セルが有効な最大の長方形」を返す（ヒストグラム法） */
+function maxRectangle(
+  valid: boolean[][],
+  rows: number,
+  cols: number
+): { r0: number; c0: number; h: number; w: number; area: number } {
+  const heights = new Array<number>(cols).fill(0);
+  let best = { r0: 0, c0: 0, h: 0, w: 0, area: 0 };
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) heights[c] = valid[r][c] ? heights[c] + 1 : 0;
+    const stack: number[] = [];
+    for (let c = 0; c <= cols; c++) {
+      const hc = c === cols ? 0 : heights[c];
+      while (stack.length && heights[stack[stack.length - 1]] >= hc) {
+        const top = stack.pop()!;
+        const height = heights[top];
+        const left = stack.length ? stack[stack.length - 1] + 1 : 0;
+        const width = c - 1 - left + 1;
+        const area = height * width;
+        if (area > best.area) best = { r0: r - height + 1, c0: left, h: height, w: width, area };
+      }
+      stack.push(c);
+    }
+  }
+  return best;
+}
+
+/**
+ * 傾斜屋根（フラッシュ）専用：常に横置き・影離隔なしの均一グリッドで、
+ * 「全セルが屋根内に収まる最大の長方形」を配置する（東西の列数が全行で揃う＝ガタつき防止）。
+ * flushRows/flushCols 指定時はその枚数まで縮小（手動調整）。
+ */
+export function layoutFlushRoof(input: LayoutInput): LayoutResult {
+  const { n, e } = basis(input.northAngleDeg);
+  const { longM, shortM } = moduleDimsM(input.panel);
+  // 常に横置き: 東西(u)=長辺, 南北(v)=短辺
+  const panelU = longM;
+  const panelV = shortM;
+  const cellU = longM + input.colGapM;
+  const cellV = shortM + (input.rowGapM ?? 0.02);
+  const CAP = 60000; // セル数の安全弁
+
+  type Best = { facing: number; u0: number; v0: number; r0: number; c0: number; h: number; w: number; count: number };
+  let best: Best | null = null;
+
+  for (const facing of candidateFacingsRoof(input)) {
+    const uUnit = dirFromBearing(facing + 90, n, e);
+    const vUnit = dirFromBearing((facing + 180) % 360, n, e);
+    const toWorld = (u: number, v: number): Vec2 => add(scale(uUnit, u), scale(vUnit, v));
+    const uR = projectRange(input.polygonM, uUnit);
+    const vR = projectRange(input.polygonM, vUnit);
+
+    for (const pu of [0, 0.5]) {
+      for (const pv of [0, 0.5]) {
+        const u0 = uR.min + pu * cellU;
+        const v0 = vR.min + pv * cellV;
+        const ncols = Math.floor((uR.max - u0 - panelU) / cellU) + 1;
+        const nrows = Math.floor((vR.max - v0 - panelV) / cellV) + 1;
+        if (ncols < 1 || nrows < 1 || ncols * nrows > CAP) continue;
+
+        const valid: boolean[][] = [];
+        for (let j = 0; j < nrows; j++) {
+          const row: boolean[] = [];
+          const v = v0 + j * cellV;
+          for (let i = 0; i < ncols; i++) {
+            const u = u0 + i * cellU;
+            const corners = [
+              toWorld(u, v),
+              toWorld(u + panelU, v),
+              toWorld(u + panelU, v + panelV),
+              toWorld(u, v + panelV),
+            ];
+            row.push(rectInsideWithSetback(corners, input.polygonM, input.setbackM));
+          }
+          valid.push(row);
+        }
+
+        // 向き・位置は「自動最大（クランプなし）」で決める。手動指定はループ後に適用。
+        const r = maxRectangle(valid, nrows, ncols);
+        if (r.area > 0 && (!best || r.area > best.count)) {
+          best = { facing, u0, v0, r0: r.r0, c0: r.c0, h: r.h, w: r.w, count: r.area };
+        }
+      }
+    }
+  }
+
+  // 手動指定（縦=段数, 横=列数）があれば、確定した向きの中で枚数を縮小
+  if (best) {
+    if (input.flushRows && input.flushRows > 0) best.h = Math.min(best.h, input.flushRows);
+    if (input.flushCols && input.flushCols > 0) best.w = Math.min(best.w, input.flushCols);
+    best.count = best.h * best.w;
+  }
+
+  const arrays: ArrayTable[] = [];
+  let groundDepth = panelV;
+  let facingUsed = 180;
+  if (best && best.count > 0) {
+    facingUsed = best.facing;
+    const uUnit = dirFromBearing(best.facing + 90, n, e);
+    const vUnit = dirFromBearing((best.facing + 180) % 360, n, e);
+    const toWorld = (u: number, v: number): Vec2 => add(scale(uUnit, u), scale(vUnit, v));
+    const panelRects: Vec2[][] = [];
+    for (let j = 0; j < best.h; j++) {
+      for (let i = 0; i < best.w; i++) {
+        const u = best.u0 + (best.c0 + i) * cellU;
+        const v = best.v0 + (best.r0 + j) * cellV;
+        panelRects.push([
+          toWorld(u, v),
+          toWorld(u + panelU, v),
+          toWorld(u + panelU, v + panelV),
+          toWorld(u, v + panelV),
+        ]);
+      }
+    }
+    const u0 = best.u0 + best.c0 * cellU;
+    const v0 = best.v0 + best.r0 * cellV;
+    const blockW = (best.w - 1) * cellU + panelU;
+    const blockV = (best.h - 1) * cellV + panelV;
+    const corners = [
+      toWorld(u0, v0),
+      toWorld(u0 + blockW, v0),
+      toWorld(u0 + blockW, v0 + blockV),
+      toWorld(u0, v0 + blockV),
+    ];
+    arrays.push({ corners, panelRects, cols: best.w, rows: best.h, panels: best.count });
+    groundDepth = blockV;
+  }
+  return buildResult("ROOF", input, facingUsed, { arrays, pitch: cellV, gap: 0, groundDepth });
 }

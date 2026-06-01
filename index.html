@@ -207,7 +207,11 @@
             </div>
             <div id="roofFlushBox" style="display:none">
               <label>行間ギャップ(m/傾斜屋根)</label><input type="number" id="roofRowGap" value="0.02" step="0.01" />
-              <div class="hint">傾斜屋根は影離隔なしで密に配置します。傾斜角・住所(太陽計算)は使いません。境界離隔は「屋根端からの離隔」として扱われます。</div>
+              <div class="row">
+                <div><label>縦(段数/空欄=自動最大)</label><input type="number" id="flushRows" placeholder="自動" min="1" /></div>
+                <div><label>横(列数/空欄=自動最大)</label><input type="number" id="flushCols" placeholder="自動" min="1" /></div>
+              </div>
+              <div class="hint">傾斜屋根は<b>常に横置き</b>・影離隔なしの均一グリッドで、東西の列が揃う最大矩形を自動配置します。上の「段数」「パネルの向き」「列数モード」は使いません。横の間隔は「列内ギャップ」、縦の間隔は「行間ギャップ」、境界離隔は「屋根端からの離隔」。縦(段数)・横(列数)を入力すると枚数を調整できます（空欄=自動最大）。</div>
             </div>
             <div id="roofRackBox" style="display:none">
               <label>山と山の離隔(m/陸屋根・合掌)</label><input type="number" id="mountainGap" value="0.25" step="0.05" />
