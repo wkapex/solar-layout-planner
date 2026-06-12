@@ -140,8 +140,9 @@ export function buildDxf(
       text(buf, "STRING_TXT", { x: cx - tw / 2, y: cy - cth / 2 }, cth, tag);
     }
     // ② PCS設置位置。ストリング表記を最優先とし（先に配置済み）、後から置く。
-    //    アレイ上のPCSは、パネルに被らないようアレイ右端の外側に【小さめの四角】を描き、
-    //    「PCS xN」は四角のさらに右（敷地外側の余白）へ。被る場合は右へ逃がす。
+    //    アレイ上のPCSは【アレイの下辺(南側)にくっつけた小さめの四角】で表す。
+    //    横位置はPCS実位置に近い側の端へ寄せ、「PCS xN」は四角の右側へ。
+    //    回路ラベルと被る場合は四角は下へ・ラベルは右へ逃がす。
     for (const g of groupPcsBoxes(st.pccs, result.arrays)) {
       const boxW = 2.6; // 囲い 約2.6m×1.3m（小さめ固定）
       const boxH = 1.3;
@@ -149,12 +150,25 @@ export function buildDxf(
       if (g.arrayIdx != null) {
         const axs = result.arrays[g.arrayIdx].corners.map((c) => c.x);
         const ays = result.arrays[g.arrayIdx].corners.map((c) => c.y);
+        const ax0 = Math.min(...axs);
         const ax1 = Math.max(...axs);
-        const ayC = (Math.min(...ays) + Math.max(...ays)) / 2;
-        bx0 = ax1 + 0.5;
-        by0 = ayC - boxH / 2;
+        const ay0 = Math.min(...ays);
+        // PCS実位置の平均xに近い側の端へ寄せ、下辺(南側)にくっつける
+        const meanX = g.points.reduce((s, p) => s + p.x, 0) / g.points.length;
+        const leftEnd = Math.abs(meanX - ax0) <= Math.abs(meanX - ax1);
         bw = boxW;
         bh = boxH;
+        bx0 = leftEnd ? ax0 : ax1 - boxW;
+        by0 = ay0 - 0.3 - boxH; // 下辺のすぐ下（y上向きのため負方向）
+        // 回路ラベル等と被る場合はさらに下へ逃がす
+        let bRect: Box = { x0: bx0, x1: bx0 + bw, y0: by0, y1: by0 + bh };
+        let bGuard = 0;
+        while (lblHit(bRect) && bGuard < 30) {
+          by0 -= bh * 0.8;
+          bRect = { x0: bx0, x1: bx0 + bw, y0: by0, y1: by0 + bh };
+          bGuard++;
+        }
+        lblBoxes.push(bRect);
       } else {
         const cxs = g.points.map((p) => p.x);
         const cys = g.points.map((p) => p.y);

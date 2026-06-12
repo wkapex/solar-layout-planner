@@ -233,8 +233,9 @@ function renderToCanvas(input: PdfRenderInput): HTMLCanvasElement {
       ctx.fillText(tag, x, y);
     }
     // ② PCS設置位置。ストリング表記を最優先とし（先に配置済み）、後から置く。
-    //    アレイ上のPCSは、パネルに被らないようアレイ右端の外側に【小さめの四角】を描き、
-    //    「PCS×n」は四角のさらに右（敷地外側の余白）へ。被る場合は右へ逃がす。
+    //    アレイ上のPCSは【アレイの下辺にくっつけた小さめの四角】で表す。
+    //    横位置はPCS実位置に近い側の端（左端/右端）へ寄せ、「PCS×n」は四角の右側へ。
+    //    回路ラベルと被る場合は四角は下へ・ラベルは右へ逃がす。
     ctx.font = "bold 9px sans-serif";
     ctx.textAlign = "left";
     ctx.textBaseline = "middle";
@@ -243,14 +244,27 @@ function renderToCanvas(input: PdfRenderInput): HTMLCanvasElement {
       const boxH = 1.3 / mPerPx;
       let bx0: number, by0: number, bw: number, bh: number;
       if (g.arrayIdx != null) {
-        // アレイ右端のすぐ外・垂直中央
         const q = result.arrays[g.arrayIdx].corners.map((c) => mToPx(c, mPerPx));
+        const ax0 = Math.min(...q.map((p) => p.x));
         const ax1 = Math.max(...q.map((p) => p.x));
-        const ayC = (Math.min(...q.map((p) => p.y)) + Math.max(...q.map((p) => p.y))) / 2;
-        bx0 = ax1 + 0.5 / mPerPx;
-        by0 = ayC - boxH / 2;
+        const ay1 = Math.max(...q.map((p) => p.y));
+        // PCS実位置の平均xに近い側の端へ寄せ、下辺にくっつける
+        const meanX =
+          g.points.reduce((s, p) => s + mToPx(p, mPerPx).x, 0) / g.points.length;
+        const leftEnd = Math.abs(meanX - ax0) <= Math.abs(meanX - ax1);
         bw = boxW;
         bh = boxH;
+        bx0 = leftEnd ? ax0 : ax1 - boxW;
+        by0 = ay1 + 0.3 / mPerPx;
+        // 回路ラベル等と被る場合は下へ逃がす
+        let bRect: Box = { x0: bx0 - 1, x1: bx0 + bw + 1, y0: by0 - 1, y1: by0 + bh + 1 };
+        let bGuard = 0;
+        while (hit(bRect) && bGuard < 30) {
+          by0 += bh * 0.8;
+          bRect = { x0: bx0 - 1, x1: bx0 + bw + 1, y0: by0 - 1, y1: by0 + bh + 1 };
+          bGuard++;
+        }
+        placedBoxes.push(bRect);
       } else {
         // アレイ外（地上置き）はPCS位置を小さめに囲う
         const qs = g.points.map((p) => mToPx(p, mPerPx));
