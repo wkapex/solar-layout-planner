@@ -57,12 +57,26 @@
       .seg button.active { background: #3a6df0; }
       .seg button:first-child { border-radius: 5px 0 0 5px; }
       .seg button:last-child { border-radius: 0 5px 5px 0; }
+      .chk { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+      .chk input { width: auto; }
+      .chk label { margin: 0; }
     </style>
   </head>
   <body>
     <div id="app">
       <aside class="sidebar">
         <h1>🔆 陸屋根・傾斜屋根・野立太陽光 配置平面図ツール</h1>
+
+        <details>
+          <summary>💾 プロジェクト保存／再開</summary>
+          <div class="body">
+            <button id="projSave">プロジェクトを保存（.solarproj.json）</button>
+            <div class="hint">背景画像・縮尺校正・敷地・入力条件・パワコンをまとめて1ファイルに保存します。</div>
+            <label style="margin-top:10px">保存したプロジェクトを開く</label>
+            <input type="file" id="projLoad" accept=".json,application/json" />
+            <div class="hint">読み込み後、条件（列数など）を変えて「配置を生成」を押せば作り直しできます。</div>
+          </div>
+        </details>
 
         <details open>
           <summary>1. 敷地図を読み込む</summary>
@@ -195,8 +209,9 @@
 
             <div class="row">
               <div><label>傾斜角(°)</label><input type="number" id="tilt" value="20" /></div>
-              <div><label>境界離隔(m)</label><input type="number" id="setback" value="2" step="0.5" /></div>
+              <div><label>フェンス離隔(m/境界から)</label><input type="number" id="setback" value="2" step="0.5" /></div>
             </div>
+            <div class="hint">野立て：敷地境界から「フェンス離隔」ぶん内側に<b>緑のフェンスライン</b>を引き、さらに2m内側をパネル配置可能ラインとします。</div>
             <div class="row">
               <div><label>列内ギャップ(m)</label><input type="number" id="colGap" value="0.02" step="0.01" /></div>
               <div><label>アレイ間横ギャップ(m)</label><input type="number" id="sideGap" value="1" step="0.5" /></div>
@@ -215,11 +230,11 @@
                 <div><label>縦(段数/空欄=自動最大)</label><input type="number" id="flushRows" placeholder="自動" min="1" /></div>
                 <div><label>横(列数/空欄=自動最大)</label><input type="number" id="flushCols" placeholder="自動" min="1" /></div>
               </div>
-              <div class="hint">傾斜屋根は<b>常に横置き</b>・影離隔なしの均一グリッドで、東西の列が揃う最大矩形を自動配置します。上の「段数」「パネルの向き」「列数モード」「境界離隔」は使いません（屋根端離隔は東西/南北を個別指定）。横の間隔は「列内ギャップ」、縦の間隔は「行間ギャップ」。縦(段数)・横(列数)を入力すると枚数を調整できます（空欄=自動最大）。</div>
+              <div class="hint">傾斜屋根は<b>常に横置き</b>・影離隔なしの均一グリッドで、東西の列が揃う最大矩形を自動配置します。</div>
             </div>
             <div id="roofRackBox" style="display:none">
               <label>山と山の離隔(m/陸屋根・合掌)</label><input type="number" id="mountainGap" value="0.25" step="0.05" />
-              <div class="hint">陸屋根は合掌（東西・背中合わせ）の山型配置。1山＝片側1枚×2スロープ。横の列間は上の「列内ギャップ」(20mm=0.02)を使用。段数・住所は使いません。傾斜角は合掌の傾きとして奥行計算に使用。</div>
+              <div class="hint">陸屋根は合掌（東西・背中合わせ）の山型配置。横の列間は「列内ギャップ」を使用。</div>
             </div>
           </div>
         </details>
@@ -236,12 +251,55 @@
           </div>
         </details>
 
-        <details open>
-          <summary>8. DXF出力</summary>
+        <details open id="pipeSection">
+          <summary>8. DCストリング結線</summary>
           <div class="body">
-            <label>出力パターン</label>
-            <select id="exportPattern"><option value="A">パターンA（真南優先）</option><option value="B">パターンB（敷地なり最大）</option></select>
+            <label>新規PCSの既定諸元（追加時に付与・後で個別変更可）</label>
+            <div class="row">
+              <div><label>直列数(Ns)</label><input type="number" id="defNs" value="20" min="1" /></div>
+              <div><label>並列数</label><input type="number" id="defNp" value="2" min="1" /></div>
+              <div><label>MPPT入力数</label><input type="number" id="defMppt" value="1" min="1" /></div>
+            </div>
+            <div class="hint">1ストリング(=1回路) = 直列数(Ns)枚。PCS1台の回路数 = 並列 × MPPT入力数。</div>
+
+            <label>パワコン（複数台可・配置順に回路を割当）</label>
+            <div class="row">
+              <button id="pccStart" class="secondary">図面でクリックして追加</button>
+              <button id="pccDone" class="secondary">完了</button>
+              <button id="pccClear" class="secondary">クリア</button>
+            </div>
+            <div id="pipeStatus" class="hint">パワコン未設定</div>
+            <div id="pccList"></div>
+
+            <label>先方柱（任意・灰色の丸で図面に表記）</label>
+            <div class="row">
+              <button id="poleStart" class="secondary">図面でクリックして指定</button>
+              <button id="poleClear" class="secondary">クリア</button>
+            </div>
+
+            <button id="pipeGenerate">結線を生成</button>
+            <div class="hint"><b>アレイ内完結を優先</b>し、端数で完結できない場合のみ隣アレイへ連続させて Ns 枚ずつストリング化 → 配置順にPCSの回路へ割当。<b>同一PCSは同色</b>で結線し、各パネルに「PCS台番号-回路番号」を記載します。</div>
+            <div id="pipeResults"></div>
+          </div>
+        </details>
+
+        <details open>
+          <summary>9. DXF / PDF 出力</summary>
+          <div class="body">
+            <label>DXF出力パターン</label>
+            <select id="exportPattern"></select>
+            <div class="chk">
+              <input type="checkbox" id="dxfIncludePipe" checked />
+              <label>ストリング結線を含める（プレビュー中の案）</label>
+            </div>
             <button id="exportDxf">DXFをダウンロード</button>
+            <hr style="border-color:#33333c; margin:12px 0" />
+            <div class="chk">
+              <input type="checkbox" id="pdfIncludePipe" checked />
+              <label>PDFに結線を含める</label>
+            </div>
+            <button id="exportPdf">PDFをダウンロード</button>
+            <div class="hint">PDFはプレビュー中のパネル配置＋ストリング結線を1枚の図面として出力します。土地なり(パターンB)は真南=0度基準の設置角度も記載します。</div>
           </div>
         </details>
       </aside>

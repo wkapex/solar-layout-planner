@@ -19,16 +19,31 @@ import {
 } from "./layout";
 import { formatResultHtml } from "./summary";
 import { buildDxf, downloadDxf } from "./dxfExport";
-import { Vec2 } from "./geometry";
+import { Vec2, insetPolygon, polygonPerimeter } from "./geometry";
+import {
+  generateStringing,
+  StringingResult,
+  PcsUnit,
+  pcsColor,
+} from "./stringing";
+import { buildAndDownloadPdf } from "./pdfExport";
+import {
+  ProjectData,
+  bitmapToDataUrl,
+  loadImageFromDataUrl,
+  downloadProject,
+  readProjectFile,
+} from "./project";
 
 const inp = (id: string) => document.getElementById(id) as HTMLInputElement;
 const sel = (id: string) => document.getElementById(id) as HTMLSelectElement;
 const el = (id: string) => document.getElementById(id)!;
 
-type Mode = "idle" | "calib" | "poly" | "koref";
+type Mode = "idle" | "calib" | "poly" | "koref" | "pcc" | "pole";
 
 const state = {
   loaded: false,
+  imageName: "",
   mPerPx: 0,
   calibPts: [] as Vec2[],
   korefPts: [] as Vec2[],
@@ -40,6 +55,14 @@ const state = {
   lon: NaN,
   results: null as LayoutResult[] | null,
   previewIdx: 0,
+  // ---- ストリング結線 ----
+  // パワコン（画像px位置＋諸元）。直列/並列/MPPTは台ごとに保持。
+  pccList: [] as { px: Vec2; ns: number; np: number; mppt: number }[],
+  polePx: null as Vec2 | null, // 先方柱の位置（画像px）
+  stringing: null as StringingResult | null,
+  // フェンスライン（数学m・閉ポリゴン／野立てのみ。境界離隔ぶん内側）。
+  fencePolyM: null as Vec2[] | null,
+  fenceLengthM: 0, // フェンス延長(周長, m)
 };
 
 const view = new CanvasView(document.getElementById("canvas") as HTMLCanvasElement);
@@ -68,6 +91,63 @@ view.onOverlay = (ctx) => {
         ctx.stroke();
       }
     }
+  }
+
+  // ストリング結線（プレビュー）。PCSごとに色分けし、直列順にパネル中心を結ぶ。
+  if (state.stringing && state.mPerPx > 0) {
+    for (const str of state.stringing.strings) {
+      ctx.strokeStyle = pcsColor(str.pcsIndex).hex;
+      ctx.lineWidth = 2 / s;
+      ctx.beginPath();
+      str.panels.forEach((p, i) => {
+        const q = metersToImg(p.center, state.mPerPx);
+        i === 0 ? ctx.moveTo(q.x, q.y) : ctx.lineTo(q.x, q.y);
+      });
+      ctx.stroke();
+    }
+  }
+
+  // パワコン位置マーカー（□に×）を台数分
+  if (state.pccList.length > 0) {
+    const sz = 9 / s;
+    ctx.strokeStyle = "#dc2626";
+    ctx.lineWidth = 2 / s;
+    ctx.font = `${12 / s}px sans-serif`;
+    ctx.fillStyle = "#dc2626";
+    state.pccList.forEach((u, i) => {
+      const pcc = u.px;
+      ctx.strokeRect(pcc.x - sz, pcc.y - sz, sz * 2, sz * 2);
+      ctx.beginPath();
+      ctx.moveTo(pcc.x - sz, pcc.y - sz);
+      ctx.lineTo(pcc.x + sz, pcc.y + sz);
+      ctx.moveTo(pcc.x + sz, pcc.y - sz);
+      ctx.lineTo(pcc.x - sz, pcc.y + sz);
+      ctx.stroke();
+      ctx.fillText(String(i + 1), pcc.x + sz + 2 / s, pcc.y - sz);
+    });
+  }
+
+  // 先方柱（灰色の塗りつぶし丸）
+  if (state.polePx) {
+    ctx.fillStyle = "#9ca3af";
+    ctx.beginPath();
+    ctx.arc(state.polePx.x, state.polePx.y, 6 / s, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = `${11 / s}px sans-serif`;
+    ctx.fillText("先方柱", state.polePx.x + 8 / s, state.polePx.y - 4 / s);
+  }
+
+  // フェンスライン（緑・野立てのみ）。境界離隔ぶん内側の閉ポリゴン。
+  if (state.fencePolyM && state.fencePolyM.length >= 2 && state.mPerPx > 0) {
+    ctx.strokeStyle = "#22c55e";
+    ctx.lineWidth = lw * 1.2;
+    ctx.beginPath();
+    state.fencePolyM.forEach((p, i) => {
+      const q = metersToImg(p, state.mPerPx);
+      i === 0 ? ctx.moveTo(q.x, q.y) : ctx.lineTo(q.x, q.y);
+    });
+    ctx.closePath();
+    ctx.stroke();
   }
 
   // 敷地多角形
@@ -155,8 +235,80 @@ view.onClick = (p: ImgPoint) => {
     state.polyPts.push(p);
     updatePolyStatus();
     view.render();
+  } else if (state.mode === "pcc") {
+    // クリックごとにパワコンを追加（複数台対応）。既定の直列/並列/MPPTを付与。
+    state.pccList.push({ px: p, ...defaultPccSpec() });
+    updatePccStatus();
+    renderPccList();
+    status(`パワコンを${state.pccList.length}台設定しました。続けてクリックで追加／「完了」で確定。`);
+    view.render();
+  } else if (state.mode === "pole") {
+    state.polePx = p;
+    state.mode = "idle";
+    status("先方柱の位置を設定しました（灰色の丸で表記されます）。");
+    view.render();
   }
 };
+
+/** 既定のPCS諸元（入力欄から） */
+function defaultPccSpec(): { ns: number; np: number; mppt: number } {
+  return {
+    ns: parseInt(inp("defNs").value) || 1,
+    np: parseInt(inp("defNp").value) || 1,
+    mppt: parseInt(inp("defMppt").value) || 1,
+  };
+}
+
+/** パワコンの設定状況をUIに反映 */
+function updatePccStatus() {
+  el("pipeStatus").innerHTML =
+    state.pccList.length > 0
+      ? `パワコン<b>${state.pccList.length}</b>台`
+      : `<span style="color:#f59e0b">パワコン未設定</span>`;
+}
+
+/** PCSごとの諸元編集リストを描画 */
+function renderPccList() {
+  const host = el("pccList");
+  if (state.pccList.length === 0) {
+    host.innerHTML = "";
+    return;
+  }
+  host.innerHTML = state.pccList
+    .map((u, i) => {
+      const cap = (u.ns || 0) * (u.np || 0) * (u.mppt || 0);
+      return (
+        `<div class="pcc-row" data-i="${i}" style="display:flex;align-items:center;gap:4px;margin:3px 0;font-size:12px">` +
+        `<b style="width:42px">PCS${i + 1}</b>` +
+        `直列<input type="number" min="1" value="${u.ns}" data-k="ns" style="width:46px"/>` +
+        `並列<input type="number" min="1" value="${u.np}" data-k="np" style="width:46px"/>` +
+        `MPPT<input type="number" min="1" value="${u.mppt}" data-k="mppt" style="width:42px"/>` +
+        `<span style="color:#9aa">=${cap}枚</span>` +
+        `<button data-del="${i}" class="secondary" style="padding:1px 6px">×</button>` +
+        `</div>`
+      );
+    })
+    .join("");
+  // 入力変更
+  host.querySelectorAll<HTMLInputElement>("input[data-k]").forEach((inpEl) => {
+    inpEl.addEventListener("change", () => {
+      const row = inpEl.closest(".pcc-row") as HTMLElement;
+      const i = parseInt(row.dataset.i!);
+      const k = inpEl.dataset.k as "ns" | "np" | "mppt";
+      state.pccList[i][k] = parseInt(inpEl.value) || 1;
+      renderPccList();
+    });
+  });
+  // 個別削除
+  host.querySelectorAll<HTMLButtonElement>("button[data-del]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.pccList.splice(parseInt(btn.dataset.del!), 1);
+      updatePccStatus();
+      renderPccList();
+      view.render();
+    });
+  });
+}
 
 // ---------- 1. 読み込み ----------
 inp("fileInput").addEventListener("change", async (e) => {
@@ -167,6 +319,7 @@ inp("fileInput").addEventListener("change", async (e) => {
     const img = await loadSiteImage(file);
     view.setImage(img);
     state.loaded = true;
+    state.imageName = img.fileName;
     el("loadStatus").innerHTML = `<span class="ok">読込完了: ${img.fileName} (${img.width}×${img.height}px)</span>`;
     status("縮尺を校正してください。");
   } catch (err) {
@@ -276,6 +429,15 @@ el("polyUndo").addEventListener("click", () => {
   view.render();
 });
 el("polyClose").addEventListener("click", () => {
+  // 始点付近で閉じた場合の余分な終点を除去し、始点＝終点として閉じる
+  // （残すとフェンスライン等の内側オフセットがスパイク化するため）。
+  const pts = state.polyPts;
+  if (pts.length >= 4) {
+    const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
+    const diag = Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
+    const first = pts[0], last = pts[pts.length - 1];
+    if (Math.hypot(last.x - first.x, last.y - first.y) < diag * 0.02) pts.pop();
+  }
   if (state.polyPts.length < 3) return status("頂点が3つ以上必要です。");
   state.polyClosed = true;
   state.mode = "idle";
@@ -451,6 +613,13 @@ el("generateBtn").addEventListener("click", () => {
     setbackNSm: parseFloat(inp("flushSetbackNS").value) || 0,
   };
 
+  // フェンスライン（野立てのみ）：敷地境界から境界離隔ぶん内側の閉ポリゴン。
+  state.fencePolyM =
+    mountType === "tilted" && input.setbackM > 0
+      ? insetPolygon(input.polygonM, input.setbackM)
+      : null;
+  state.fenceLengthM = state.fencePolyM ? polygonPerimeter(state.fencePolyM) : 0;
+
   status("配置を計算中...");
   setTimeout(() => {
     const list: LayoutResult[] =
@@ -460,7 +629,8 @@ el("generateBtn").addEventListener("click", () => {
           ? [layoutRoofSingle(input)]
           : [layoutFlushRoof(input)];
     showResults(list);
-    status("生成完了: " + list.map((r) => `${patternLabel(r)}=${r.totalPanels}枚(${r.totalKw.toFixed(1)}kW)`).join(" / "));
+    const fenceMsg = state.fenceLengthM > 0 ? ` ／ フェンス延長 ${state.fenceLengthM.toFixed(1)}m` : "";
+    status("生成完了: " + list.map((r) => `${patternLabel(r)}=${r.totalPanels}枚(${r.totalKw.toFixed(1)}kW)`).join(" / ") + fenceMsg);
   }, 20);
 });
 
@@ -508,10 +678,268 @@ el("exportDxf").addEventListener("click", () => {
   const result = state.results[idx];
   if (!result) return status("出力対象を選択してください。");
   const siteM = imgToMeters(state.polyPts, state.mPerPx);
+  // 結線を含めるか（生成済みかつチェックON）
+  const includeStr =
+    !!(document.getElementById("dxfIncludePipe") as HTMLInputElement)?.checked && !!state.stringing;
   const dxf = buildDxf(siteM, result, {
     northAngleDeg: parseFloat(inp("northAngle").value) || 0,
+    stringing: includeStr ? state.stringing! : undefined,
+    fence: state.fencePolyM,
+    fenceLengthM: state.fenceLengthM,
+    moduleLabel: moduleLabel(),
+    pole: state.polePx ? imgToMeters([state.polePx], state.mPerPx)[0] : null,
   });
   const date = new Date().toISOString().slice(0, 10);
   downloadDxf(`solar_layout_${result.pattern}_${date}.dxf`, dxf);
-  status(`DXFを出力しました（${patternLabel(result)}）。`);
+  status(`DXFを出力しました（${patternLabel(result)}${includeStr ? " + 結線" : ""}）。`);
+});
+
+// ========== 9. 配管 ==========
+// パワコン位置の指定（複数台。クリックごとに追加）
+el("pccStart").addEventListener("click", () => {
+  if (!state.loaded) return status("先に敷地図を読み込んでください。");
+  state.mode = "pcc";
+  status("パワコン位置を図面上でクリックしてください（複数台は続けてクリック）。");
+});
+// パワコン追加完了
+el("pccDone").addEventListener("click", () => {
+  state.mode = "idle";
+  updatePccStatus();
+  status(`パワコン ${state.pccList.length}台で確定しました。`);
+});
+// パワコンをすべてクリア
+el("pccClear").addEventListener("click", () => {
+  state.pccList = [];
+  state.mode = "idle";
+  updatePccStatus();
+  renderPccList();
+  view.render();
+  status("パワコンをクリアしました。");
+});
+
+// 先方柱の指定／クリア
+el("poleStart").addEventListener("click", () => {
+  if (!state.loaded) return status("先に敷地図を読み込んでください。");
+  state.mode = "pole";
+  status("先方柱の位置を図面上でクリックしてください。");
+});
+el("poleClear").addEventListener("click", () => {
+  state.polePx = null;
+  state.mode = "idle";
+  view.render();
+  status("先方柱をクリアしました。");
+});
+
+/** モジュール型番ラベル（メーカー＋型式。両方未入力なら null） */
+function moduleLabel(): string | null {
+  const s = `${inp("pMaker").value} ${inp("pModel").value}`.trim();
+  return s ? s : null;
+}
+
+// ストリング結線を生成（アレイ内完結優先・蛇行・PCS別色分け）
+el("pipeGenerate").addEventListener("click", () => {
+  if (!state.results || !state.results[state.previewIdx])
+    return status("先にパネル配置を生成してください（結線はプレビュー中の配置に対して引きます）。");
+  if (state.mPerPx <= 0) return status("縮尺が未校正です。");
+  if (state.pccList.length === 0) return status("パワコン位置を1台以上指定してください。");
+
+  // px → 数学m。PCSは諸元つき。
+  const pccs: PcsUnit[] = state.pccList.map((u) => ({
+    pos: imgToMeters([u.px], state.mPerPx)[0],
+    ns: u.ns,
+    np: u.np,
+    mppt: u.mppt,
+  }));
+  const layout = state.results[state.previewIdx];
+
+  state.stringing = generateStringing({ layout, pccs });
+  showStringingResults();
+  status(
+    `結線生成完了: ${state.stringing.ns}直列 / ${state.stringing.totalStrings}ストリング / PCS${state.stringing.pccSummaries.length}台` +
+      (state.stringing.warnings.length ? ` ⚠${state.stringing.warnings.length}件` : "")
+  );
+});
+
+function showStringingResults() {
+  const p = state.stringing;
+  if (!p) return;
+  const rows = p.pccSummaries
+    .map((s, i) => {
+      const col = pcsColor(i).hex;
+      return (
+        `<tr><td><span style="display:inline-block;width:10px;height:10px;background:${col};border-radius:2px;margin-right:4px"></span>PCS${i + 1}</td>` +
+        `<td>${s.strings}回路</td><td>${s.panels}枚</td>` +
+        `<td style="color:#9aa">${s.capacityStrings}回路</td></tr>`
+      );
+    })
+    .join("");
+  const warn = p.warnings.length
+    ? `<div style="color:#f59e0b;margin-top:6px">⚠ ${p.warnings.join("<br>⚠ ")}</div>`
+    : "";
+  el("pipeResults").innerHTML =
+    `<div class="result-card"><h3>DCストリング結線</h3>` +
+    `<div>直列数: <b>${p.ns}</b>　総ストリング: <b>${p.totalStrings}</b></div>` +
+    `<table style="width:100%;margin-top:6px;font-size:12px;border-collapse:collapse">` +
+    `<tr style="color:#9aa"><th align="left">PCS</th><th align="left">回路数</th><th align="left">枚数</th><th align="left">容量</th></tr>` +
+    rows +
+    `</table>${warn}</div>`;
+  view.render();
+}
+
+// ---------- 10. PDF出力 ----------
+el("exportPdf").addEventListener("click", async () => {
+  if (!state.results || !state.results[state.previewIdx])
+    return status("先にパネル配置を生成してください。");
+  const result = state.results[state.previewIdx];
+  const includeStr =
+    !!(document.getElementById("pdfIncludePipe") as HTMLInputElement)?.checked && !!state.stringing;
+  status("PDFを生成中...");
+  try {
+    const date = new Date().toISOString().slice(0, 10);
+    await buildAndDownloadPdf(
+      {
+        background: view.imageCanvas,
+        sitePolyPx: state.polyPts,
+        result,
+        stringing: includeStr ? state.stringing : null,
+        fenceM: state.fencePolyM,
+        fenceLengthM: state.fenceLengthM,
+        moduleLabel: moduleLabel(),
+        poleM: state.polePx ? imgToMeters([state.polePx], state.mPerPx)[0] : null,
+        mPerPx: state.mPerPx,
+        title: `太陽光配置図 ${patternLabel(result)}${includeStr ? " + ストリング結線" : ""}  ${date}`,
+      },
+      `solar_plan_${result.pattern}_${date}.pdf`
+    );
+    status("PDFを出力しました。");
+  } catch (err) {
+    status(`<span class="err">PDF出力エラー: ${(err as Error).message}</span>`);
+  }
+});
+
+// ========== 11. プロジェクト保存／再開 ==========
+// 背景画像・校正・敷地・入力条件・PCSを1つのJSONに保存し、後日読み込んで編集を再開する。
+
+/** 保存対象の input / select の id（画面の入力条件すべて） */
+const PROJ_INPUT_IDS = [
+  // 校正
+  "calibMethod", "calibDist", "calibUnit",
+  "ref1x", "ref1y", "ref2x", "ref2y", "jprZone",
+  // 設置場所
+  "address", "lat", "lon",
+  // パネル仕様
+  "pMaker", "pModel", "pW", "pH", "pWatt",
+  // 配置の制約
+  "mountType", "orientation", "tiers", "colMode", "maxCols",
+  "spec1", "spec2", "spec3",
+  "tilt", "setback", "colGap", "sideGap", "northAngle", "manualPitch",
+  "roofRowGap", "flushSetbackEW", "flushSetbackNS", "flushRows", "flushCols",
+  "mountainGap",
+  // 結線
+  "defNs", "defNp", "defMppt",
+];
+const PROJ_CHECK_IDS = ["dxfIncludePipe", "pdfIncludePipe"];
+
+function gatherProject(): ProjectData {
+  const inputs: Record<string, string> = {};
+  for (const id of PROJ_INPUT_IDS) {
+    const e = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+    if (e) inputs[id] = e.value;
+  }
+  const checks: Record<string, boolean> = {};
+  for (const id of PROJ_CHECK_IDS) {
+    const e = document.getElementById(id) as HTMLInputElement | null;
+    if (e) checks[id] = e.checked;
+  }
+  return {
+    version: 1,
+    savedAt: new Date().toISOString(),
+    imageDataUrl: view.imageCanvas ? bitmapToDataUrl(view.imageCanvas) : null,
+    imageFileName: state.imageName,
+    mPerPx: state.mPerPx,
+    lat: Number.isFinite(state.lat) ? state.lat : null,
+    lon: Number.isFinite(state.lon) ? state.lon : null,
+    polyPts: state.polyPts,
+    polyClosed: state.polyClosed,
+    pccList: state.pccList,
+    polePx: state.polePx,
+    inputs,
+    checks,
+  };
+}
+
+async function applyProject(data: ProjectData) {
+  // 背景画像
+  if (data.imageDataUrl) {
+    const img = await loadImageFromDataUrl(data.imageDataUrl, data.imageFileName || "(保存済み画像)");
+    view.setImage(img);
+    state.loaded = true;
+    state.imageName = img.fileName;
+    el("loadStatus").innerHTML = `<span class="ok">プロジェクトから復元: ${img.fileName} (${img.width}×${img.height}px)</span>`;
+  }
+  // 入力欄
+  for (const [id, val] of Object.entries(data.inputs)) {
+    const e = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+    if (e) e.value = val;
+  }
+  for (const [id, on] of Object.entries(data.checks ?? {})) {
+    const e = document.getElementById(id) as HTMLInputElement | null;
+    if (e) e.checked = on;
+  }
+  // 表示切替（設置タイプ・列数モード・校正方法）を入力値に追従させる
+  sel("mountType").dispatchEvent(new Event("change"));
+  sel("colMode").dispatchEvent(new Event("change"));
+  sel("calibMethod").dispatchEvent(new Event("change"));
+  // 状態
+  state.mPerPx = data.mPerPx || 0;
+  state.lat = data.lat ?? NaN;
+  state.lon = data.lon ?? NaN;
+  state.polyPts = data.polyPts ?? [];
+  state.polyClosed = !!data.polyClosed;
+  state.pccList = data.pccList ?? [];
+  state.polePx = data.polePx ?? null;
+  state.calibPts = [];
+  state.korefPts = [];
+  // 生成物はクリア（条件から再生成してもらう）
+  state.results = null;
+  state.stringing = null;
+  state.fencePolyM = null;
+  state.fenceLengthM = 0;
+  state.previewIdx = 0;
+  el("results").innerHTML = "";
+  el("pipeResults").innerHTML = "";
+  el("previewSeg").innerHTML = "";
+  (el("previewSeg") as HTMLElement).style.display = "none";
+  sel("exportPattern").innerHTML = "";
+  // ステータス表示
+  el("calibStatus").innerHTML =
+    state.mPerPx > 0
+      ? `<span class="ok">校正済: ${(state.mPerPx * 1000).toFixed(2)} mm/px（プロジェクトから復元）</span>`
+      : "未校正";
+  updatePolyStatus();
+  updatePccStatus();
+  renderPccList();
+  view.render();
+  status("プロジェクトを読み込みました。条件を調整して「配置を生成」を押すと再生成できます。");
+}
+
+el("projSave").addEventListener("click", () => {
+  if (!state.loaded) return status("保存する内容がありません。先に敷地図を読み込んでください。");
+  const date = new Date().toISOString().slice(0, 10);
+  const base = (state.imageName || "project").replace(/\.[^.]+$/, "");
+  downloadProject(gatherProject(), `${base}_${date}.solarproj.json`);
+  status("プロジェクトを保存しました（.solarproj.json）。");
+});
+
+inp("projLoad").addEventListener("change", async (e) => {
+  const file = (e.target as HTMLInputElement).files?.[0];
+  if (!file) return;
+  status("プロジェクトを読み込み中...");
+  try {
+    await applyProject(await readProjectFile(file));
+  } catch (err) {
+    status(`<span class="err">読み込みエラー: ${(err as Error).message}</span>`);
+  } finally {
+    (e.target as HTMLInputElement).value = ""; // 同じファイルの再選択を可能に
+  }
 });

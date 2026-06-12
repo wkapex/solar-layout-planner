@@ -71,6 +71,11 @@ export class CanvasView {
     return this.scale;
   }
 
+  /** 読み込み済み画像のビットマップ（PDF背景用）。未読込はnull */
+  get imageCanvas(): HTMLCanvasElement | null {
+    return this.image ? this.image.bitmap : null;
+  }
+
   private bindEvents() {
     this.canvas.addEventListener("wheel", (e) => {
       e.preventDefault();

@@ -19,7 +19,11 @@ export function formatResultHtml(r: LayoutResult, areaM2: number): string {
           ? "陸屋根（合掌・東西設置）"
           : "傾斜屋根（フラッシュ設置）";
   const azimuth =
-    r.pattern === "B" ? `<div>パネル向き: <b>${r.azimuthOffsetLabel}</b></div>` : "";
+    r.pattern === "B"
+      ? `<div>設置角度（真南=0度）: <b>${r.azimuthOffsetLabel}</b></div>`
+      : r.pattern === "A"
+        ? `<div>設置角度（真南=0度）: <b>真南</b></div>`
+        : "";
   const areaLabel = r.pattern === "ROOF" ? "屋根面積" : "敷地面積";
   const grid = r.arrays[0];
   const pitchLine =

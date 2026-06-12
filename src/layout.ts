@@ -67,6 +67,9 @@ export interface LayoutResult {
 
 const deg2rad = (d: number) => (d * Math.PI) / 180;
 
+/** 野立て：フェンスライン（境界離隔）から内側へさらに確保するパネル配置の余白(m) */
+export const FENCE_PANEL_INSET_M = 2;
+
 /** 北方向角から north/east 単位ベクトル（数学座標）を作る */
 function basis(northAngleDeg: number): { n: Vec2; e: Vec2 } {
   const a = deg2rad(northAngleDeg);
@@ -135,6 +138,9 @@ function placeArrays(
   const { n, e } = basis(input.northAngleDeg);
   const tilt = deg2rad(input.tiltDeg);
   const mode = input.mountType; // "tilted" | "rack" | "flush"
+  // 野立てのみ：境界離隔=フェンスラインとし、その内側2mを配置可能ラインとする。
+  const effSetback =
+    mode === "tilted" ? input.setbackM + FENCE_PANEL_INSET_M : input.setbackM;
   const { slopeLen, rowWidth } = perPanelDims(input.panel, input.orientation);
 
   // u: 列方向（行幅）, v: 前後（奥行）方向
@@ -207,37 +213,54 @@ function placeArrays(
 
   const cands = columnCandidates(input.columnMode);
   const tableWidth = (c: number) => c * rowWidth + (c - 1) * input.colGapM;
-  const probeStep = rowWidth + input.colGapM; // 何も置けない時の走査ステップ
+  // 何も置けない時の走査ステップ。粗いと回転敷地で置ける位置を飛ばすため細かめに刻む。
+  const probeStep = Math.max(0.25, (rowWidth + input.colGapM) / 4);
 
-  const arrays: ArrayTable[] = [];
-  const maxRows = 2000;
-  let rowCount = 0;
-  for (let v = vRange.min; v <= vRange.max && rowCount < maxRows; v += pitch, rowCount++) {
-    let u = uRange.min;
-    let guard = 0;
-    while (u <= uRange.max && guard < 5000) {
-      guard++;
-      let placed = false;
-      for (const c of cands) {
-        const w = tableWidth(c);
-        const corners = rect(u, v, w, groundDepth);
-        if (rectInsideWithSetback(corners, input.polygonM, input.setbackM)) {
-          arrays.push({
-            corners,
-            panelRects: buildPanelRects(u, v, c),
-            cols: c,
-            rows: panelsPerCol,
-            panels: c * panelsPerCol,
-          });
-          u += w + input.sideGapM;
-          placed = true;
-          break;
+  // 行の開始位相（vRange.min からのオフセット）を複数試し、総枚数最大の案を採る。
+  // 固定位相だと回転敷地で先頭行が「角の置けない領域」に浪費され枚数が伸びないため。
+  const phases = [0, 0.2, 0.4, 0.6, 0.8];
+  let bestArrays: ArrayTable[] = [];
+  let bestPanels = -1;
+  for (const ph of phases) {
+    const arrays: ArrayTable[] = [];
+    const maxRows = 2000;
+    let rowCount = 0;
+    for (
+      let v = vRange.min + ph * pitch;
+      v <= vRange.max && rowCount < maxRows;
+      v += pitch, rowCount++
+    ) {
+      let u = uRange.min;
+      let guard = 0;
+      while (u <= uRange.max && guard < 20000) {
+        guard++;
+        let placed = false;
+        for (const c of cands) {
+          const w = tableWidth(c);
+          const corners = rect(u, v, w, groundDepth);
+          if (rectInsideWithSetback(corners, input.polygonM, effSetback)) {
+            arrays.push({
+              corners,
+              panelRects: buildPanelRects(u, v, c),
+              cols: c,
+              rows: panelsPerCol,
+              panels: c * panelsPerCol,
+            });
+            u += w + input.sideGapM;
+            placed = true;
+            break;
+          }
         }
+        if (!placed) u += probeStep;
       }
-      if (!placed) u += probeStep;
+    }
+    const panels = arrays.reduce((s, a) => s + a.panels, 0);
+    if (panels > bestPanels) {
+      bestPanels = panels;
+      bestArrays = arrays;
     }
   }
-  return { arrays, pitch, gap, groundDepth };
+  return { arrays: bestArrays, pitch, gap, groundDepth };
 }
 
 function azimuthLabel(facingBearingDeg: number): { offset: number; label: string } {
@@ -276,6 +299,24 @@ function buildResult(
     azimuthOffsetLabel: label,
     colCountBreakdown: breakdown,
   };
+}
+
+/**
+ * アレイ構成の表記文字列（例: "2段18列×10アレイ / 2段9列×1アレイ"）。
+ * 段×列の組み合わせごとに台数を集計し、列数の多い順に並べる。
+ */
+export function arrayComposition(result: LayoutResult): string {
+  const counts = new Map<string, { rows: number; cols: number; n: number }>();
+  for (const a of result.arrays) {
+    const key = `${a.rows}x${a.cols}`;
+    const e = counts.get(key);
+    if (e) e.n++;
+    else counts.set(key, { rows: a.rows, cols: a.cols, n: 1 });
+  }
+  return [...counts.values()]
+    .sort((p, q) => q.cols - p.cols || q.rows - p.rows)
+    .map((e) => `${e.rows}段${e.cols}列×${e.n}アレイ`)
+    .join(" / ");
 }
 
 /** パターンA：真南固定 */
