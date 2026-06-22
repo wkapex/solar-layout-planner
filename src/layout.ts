@@ -23,6 +23,10 @@ export interface LayoutInput {
   polygonM: Vec2[]; // 敷地多角形（数学m）
   panel: PanelSpec;
   orientation: Orientation;
+  /** 陸屋根（合掌）の向き: ew=東西向き（棟は南北・現状の計算）/ ns=南北向き（棟は東西・90度回転） */
+  rackDir?: "ew" | "ns";
+  /** 複数区画で向きを統一するため facing を外部から固定する（指定時は候補探索せずこの向きで配置） */
+  forcedFacing?: number;
   tiers: number; // 段数
   columnMode: ColumnMode;
   tiltDeg: number;
@@ -50,6 +54,23 @@ export interface ArrayTable {
   panels: number;
 }
 
+/**
+ * 配置グリッド（格子）情報。手動でパネルを増設する際の「吸着先」を計算するために公開する。
+ * 列(u方向)は colPitch 間隔、段(アレイ)は bandPitch 間隔で並び、1アレイ内には
+ * v方向に subCount 枚（各 subDepth の奥行）が積まれる。座標はすべて数学m。
+ */
+export interface LayoutGrid {
+  uUnit: Vec2; // 列方向の単位ベクトル
+  vUnit: Vec2; // 前後（段をまたぐ）方向の単位ベクトル
+  uOrigin: number; // 列の基準位置（u座標）
+  vOrigin: number; // 段の基準位置（v座標）
+  colPitch: number; // 列ピッチ（rowWidth + 列内ギャップ）
+  bandPitch: number; // 段（アレイ）ピッチ
+  subDepth: number; // 1パネルのv方向奥行
+  subCount: number; // 1アレイ内のv方向パネル数
+  panelW: number; // 1パネルのu方向幅
+}
+
 export interface LayoutResult {
   pattern: "A" | "B" | "ROOF";
   mountType: "tilted" | "rack" | "flush";
@@ -63,6 +84,7 @@ export interface LayoutResult {
   azimuthOffsetDeg: number; // 真南からの振れ（+=西, -=東）
   azimuthOffsetLabel: string;
   colCountBreakdown: Record<number, number>;
+  grid?: LayoutGrid; // 手動増設の吸着用グリッド（配置が空のときは未設定）
 }
 
 const deg2rad = (d: number) => (d * Math.PI) / 180;
@@ -134,14 +156,16 @@ function columnCandidates(mode: ColumnMode): number[] {
 function placeArrays(
   input: LayoutInput,
   facingBearingDeg: number
-): { arrays: ArrayTable[]; pitch: number; gap: number; groundDepth: number } {
+): { arrays: ArrayTable[]; pitch: number; gap: number; groundDepth: number; grid: LayoutGrid } {
   const { n, e } = basis(input.northAngleDeg);
   const tilt = deg2rad(input.tiltDeg);
   const mode = input.mountType; // "tilted" | "rack" | "flush"
   // 野立てのみ：境界離隔=フェンスラインとし、その内側2mを配置可能ラインとする。
   const effSetback =
     mode === "tilted" ? input.setbackM + FENCE_PANEL_INSET_M : input.setbackM;
-  const { slopeLen, rowWidth } = perPanelDims(input.panel, input.orientation);
+  // 陸屋根（合掌）は常に横置き（短辺を斜面に沿わせる低い山型）。向きは rackDir で東西/南北を切替える。
+  const effOrientation: Orientation = mode === "rack" ? "landscape" : input.orientation;
+  const { slopeLen, rowWidth } = perPanelDims(input.panel, effOrientation);
 
   // u: 列方向（行幅）, v: 前後（奥行）方向
   const uUnit = dirFromBearing(facingBearingDeg + 90, n, e);
@@ -158,6 +182,7 @@ function placeArrays(
   // モード別：アレイ奥行・1列あたり枚数・パネル矩形の作り方
   let groundDepth: number;
   let panelsPerCol: number;
+  let subDepth: number; // 1パネルのv方向奥行（手動グリッド用）
   let buildPanelRects: (u0: number, v0: number, c: number) => Vec2[][];
 
   if (mode === "rack") {
@@ -165,6 +190,7 @@ function placeArrays(
     const sd = slopeLen * Math.cos(tilt);
     groundDepth = 2 * sd;
     panelsPerCol = 2;
+    subDepth = sd;
     buildPanelRects = (u0, v0, c) => {
       const rects: Vec2[][] = [];
       for (let j = 0; j < c; j++) {
@@ -179,6 +205,7 @@ function placeArrays(
     const tierDepth = mode === "flush" ? slopeLen : slopeLen * Math.cos(tilt);
     groundDepth = input.tiers * tierDepth;
     panelsPerCol = input.tiers;
+    subDepth = tierDepth;
     buildPanelRects = (u0, v0, c) => {
       const rects: Vec2[][] = [];
       for (let j = 0; j < c; j++) {
@@ -213,14 +240,19 @@ function placeArrays(
 
   const cands = columnCandidates(input.columnMode);
   const tableWidth = (c: number) => c * rowWidth + (c - 1) * input.colGapM;
-  // 何も置けない時の走査ステップ。粗いと回転敷地で置ける位置を飛ばすため細かめに刻む。
-  const probeStep = Math.max(0.25, (rowWidth + input.colGapM) / 4);
+  // 全アレイの開始位置を「単一パネル列ピッチの共通グリッド」に吸着させる。
+  // アレイは整数列ぶんの幅なので、全パネルの列が uAnchor + 整数×cellPitch 上に揃い、
+  // 敷地が多少傾いていても行ごとの列ズレ（ドリフト）が発生しない。
+  const cellPitch = rowWidth + input.colGapM;
+  const uAnchor = uRange.min;
+  const snapUp = (u: number) => uAnchor + Math.ceil((u - uAnchor) / cellPitch - 1e-6) * cellPitch;
 
   // 行の開始位相（vRange.min からのオフセット）を複数試し、総枚数最大の案を採る。
   // 固定位相だと回転敷地で先頭行が「角の置けない領域」に浪費され枚数が伸びないため。
   const phases = [0, 0.2, 0.4, 0.6, 0.8];
   let bestArrays: ArrayTable[] = [];
   let bestPanels = -1;
+  let bestPhase = 0; // 採用した行開始位相（グリッド原点の算出に使う）
   for (const ph of phases) {
     const arrays: ArrayTable[] = [];
     const maxRows = 2000;
@@ -230,10 +262,11 @@ function placeArrays(
       v <= vRange.max && rowCount < maxRows;
       v += pitch, rowCount++
     ) {
-      let u = uRange.min;
+      let u = uAnchor;
       let guard = 0;
       while (u <= uRange.max && guard < 20000) {
         guard++;
+        u = snapUp(u); // 共通グリッドの列位置に揃える
         let placed = false;
         for (const c of cands) {
           const w = tableWidth(c);
@@ -246,21 +279,50 @@ function placeArrays(
               rows: panelsPerCol,
               panels: c * panelsPerCol,
             });
-            u += w + input.sideGapM;
+            // アレイ末尾＋横ギャップの先、次の格子列へ（隣アレイも同一グリッド上）
+            u = snapUp(u + w + input.sideGapM);
             placed = true;
             break;
           }
         }
-        if (!placed) u += probeStep;
+        if (!placed) u += cellPitch; // 収まらなければ次の格子列へ
       }
     }
     const panels = arrays.reduce((s, a) => s + a.panels, 0);
     if (panels > bestPanels) {
       bestPanels = panels;
       bestArrays = arrays;
+      bestPhase = ph;
     }
   }
-  return { arrays: bestArrays, pitch, gap, groundDepth };
+  // グリッド原点は「実際に置かれたパネル」の左下端に合わせる（手動増設が自動列と整列するように）。
+  // 置けたパネルが無いときのみ走査範囲の端を使う。
+  let gridU0 = uRange.min;
+  let gridV0 = vRange.min + bestPhase * pitch;
+  if (bestArrays.length > 0) {
+    let uMin = Infinity, vMin = Infinity;
+    for (const a of bestArrays)
+      for (const rectP of a.panelRects)
+        for (const p of rectP) {
+          const u = dot(p, uUnit), v = dot(p, vUnit);
+          if (u < uMin) uMin = u;
+          if (v < vMin) vMin = v;
+        }
+    gridU0 = uMin;
+    gridV0 = vMin;
+  }
+  const grid: LayoutGrid = {
+    uUnit,
+    vUnit,
+    uOrigin: gridU0,
+    vOrigin: gridV0,
+    colPitch: rowWidth + input.colGapM,
+    bandPitch: pitch,
+    subDepth,
+    subCount: panelsPerCol,
+    panelW: rowWidth,
+  };
+  return { arrays: bestArrays, pitch, gap, groundDepth, grid };
 }
 
 function azimuthLabel(facingBearingDeg: number): { offset: number; label: string } {
@@ -275,7 +337,7 @@ function buildResult(
   pattern: "A" | "B" | "ROOF",
   input: LayoutInput,
   facingBearingDeg: number,
-  placed: ReturnType<typeof placeArrays>
+  placed: { arrays: ArrayTable[]; pitch: number; gap: number; groundDepth: number; grid?: LayoutGrid }
 ): LayoutResult {
   const totalPanels = placed.arrays.reduce((s, a) => s + a.panels, 0);
   const breakdown: Record<number, number> = {};
@@ -298,6 +360,7 @@ function buildResult(
     azimuthOffsetDeg: offset,
     azimuthOffsetLabel: label,
     colCountBreakdown: breakdown,
+    grid: placed.grid,
   };
 }
 
@@ -379,16 +442,66 @@ function candidateFacingsRoof(input: LayoutInput): number[] {
   return [...set];
 }
 
-/** 陸屋根（合掌）：屋根なりに密に配置し、枚数最大の向きを採用 */
+/**
+ * 陸屋根（合掌）：屋根なりに密に配置し、指定向き（東西/南北）の中から枚数最大を採用。
+ * 合掌の傾斜面は v 軸（=dirFromBearing(facing+180)）方向。東西向き=v軸が東西寄り、
+ * 南北向き=v軸が南北寄り（東西向きを90度回転した形）。
+ */
 export function layoutRoofSingle(input: LayoutInput): LayoutResult {
+  // 向きが外部指定されている場合（複数区画の統一）は、その facing で固定配置する。
+  if (input.forcedFacing != null) {
+    return buildResult("ROOF", input, input.forcedFacing, placeArrays(input, input.forcedFacing));
+  }
+  const { n, e } = basis(input.northAngleDeg);
+  const dir = input.rackDir ?? "ew";
+  const isEW = (f: number): boolean => {
+    const v = dirFromBearing((f + 180) % 360, n, e);
+    return Math.abs(dot(v, e)) >= Math.abs(dot(v, n));
+  };
+  const all = candidateFacingsRoof(input);
+  const filtered = all.filter((f) => (dir === "ew" ? isEW(f) : !isEW(f)));
+  const cands = filtered.length > 0 ? filtered : all;
   let best: { facing: number; placed: ReturnType<typeof placeArrays>; panels: number } | null =
     null;
-  for (const facing of candidateFacingsRoof(input)) {
+  for (const facing of cands) {
     const placed = placeArrays(input, facing);
     const panels = placed.arrays.reduce((s, a) => s + a.panels, 0);
     if (!best || panels > best.panels) best = { facing, placed, panels };
   }
   return buildResult("ROOF", input, best!.facing, best!.placed);
+}
+
+/**
+ * 複数区画で「合掌の向き(facing)」を統一するための共通向きを決める。
+ * 各区画の候補facing（rackDirで東西/南北に絞り込み）の和集合から、
+ * 全区画合計の配置枚数が最大になる1つの向きを返す（区画が無ければ null）。
+ * 返した facing を各区画の forcedFacing に渡せば全区画の振れ角が一致する。
+ */
+export function unifiedRackFacing(inputs: LayoutInput[]): number | null {
+  if (inputs.length === 0) return null;
+  const candSet = new Set<number>();
+  const addFor = (input: LayoutInput, filterDir: boolean) => {
+    const { n, e } = basis(input.northAngleDeg);
+    const dir = input.rackDir ?? "ew";
+    const isEW = (f: number) => {
+      const v = dirFromBearing((f + 180) % 360, n, e);
+      return Math.abs(dot(v, e)) >= Math.abs(dot(v, n));
+    };
+    for (const f of candidateFacingsRoof(input)) {
+      const keep = !filterDir || (dir === "ew" ? isEW(f) : !isEW(f));
+      if (keep) candSet.add(Math.round(f * 10) / 10);
+    }
+  };
+  for (const input of inputs) addFor(input, true);
+  if (candSet.size === 0) for (const input of inputs) addFor(input, false);
+  let best: { facing: number; total: number } | null = null;
+  for (const facing of candSet) {
+    let total = 0;
+    for (const input of inputs)
+      total += placeArrays(input, facing).arrays.reduce((s, a) => s + a.panels, 0);
+    if (!best || total > best.total) best = { facing, total };
+  }
+  return best ? best.facing : null;
 }
 
 /** 2値行列内の「全セルが有効な最大の長方形」を返す（ヒストグラム法） */
@@ -513,11 +626,23 @@ export function layoutFlushRoof(input: LayoutInput): LayoutResult {
   const arrays: ArrayTable[] = [];
   let groundDepth = panelV;
   let facingUsed = 180;
+  let grid: LayoutGrid | undefined;
   if (best && best.count > 0) {
     facingUsed = best.facing;
     const uUnit = dirFromBearing(best.facing + 90, n, e);
     const vUnit = dirFromBearing((best.facing + 180) % 360, n, e);
     const toWorld = (u: number, v: number): Vec2 => add(scale(uUnit, u), scale(vUnit, v));
+    grid = {
+      uUnit,
+      vUnit,
+      uOrigin: best.u0 + best.c0 * cellU,
+      vOrigin: best.v0 + best.r0 * cellV,
+      colPitch: cellU,
+      bandPitch: cellV,
+      subDepth: panelV,
+      subCount: 1,
+      panelW: panelU,
+    };
     const panelRects: Vec2[][] = [];
     for (let j = 0; j < best.h; j++) {
       for (let i = 0; i < best.w; i++) {
@@ -544,5 +669,5 @@ export function layoutFlushRoof(input: LayoutInput): LayoutResult {
     arrays.push({ corners, panelRects, cols: best.w, rows: best.h, panels: best.count });
     groundDepth = blockV;
   }
-  return buildResult("ROOF", input, facingUsed, { arrays, pitch: cellV, gap: 0, groundDepth });
+  return buildResult("ROOF", input, facingUsed, { arrays, pitch: cellV, gap: 0, groundDepth, grid });
 }

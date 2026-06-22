@@ -11,14 +11,14 @@ import { metersToImg } from "./polygon";
 export interface PdfRenderInput {
   /** 元敷地図のビットマップ（任意。背景に薄く敷く） */
   background?: HTMLCanvasElement | null;
-  /** 敷地多角形（画像px座標） */
-  sitePolyPx: Vec2[];
-  /** 配置結果 */
+  /** 敷地多角形（画像px座標）。区画ごとに1つ。 */
+  sitePolysPx: Vec2[][];
+  /** 配置結果（全区画を統合した1つの結果） */
   result: LayoutResult;
   /** ストリング結線結果（任意） */
   stringing?: StringingResult | null;
-  /** フェンスライン（数学m・閉ポリゴン／野立てのみ）。緑で描画。 */
-  fenceM?: Vec2[] | null;
+  /** フェンスライン（数学m・閉ポリゴン／野立てのみ・区画ごと）。緑で描画。 */
+  fencesM?: (Vec2[] | null)[];
   /** フェンス延長（周長, m）。凡例に表記。 */
   fenceLengthM?: number;
   /** モジュール型番（メーカー＋型式）。凡例に表記。 */
@@ -41,7 +41,8 @@ function renderToCanvas(input: PdfRenderInput): HTMLCanvasElement {
   const { result, stringing, mPerPx } = input;
 
   // 描画対象の全点から境界ボックスを求める（px座標）
-  const pts: Vec2[] = [...input.sitePolyPx];
+  const pts: Vec2[] = [];
+  for (const poly of input.sitePolysPx) for (const c of poly) pts.push(c);
   for (const arr of result.arrays)
     for (const rect of arr.panelRects)
       for (const c of rect) pts.push(mToPx(c, mPerPx));
@@ -69,7 +70,7 @@ function renderToCanvas(input: PdfRenderInput): HTMLCanvasElement {
     segs.push(`設置角度: ${result.azimuthOffsetLabel}（真南=0度）`);
   if (result.mountType === "tilted")
     segs.push(`南北アレイ間離隔: ${Math.max(0, result.pitchM - result.groundDepthM).toFixed(2)}m`);
-  if (input.fenceM && input.fenceLengthM && input.fenceLengthM > 0)
+  if (input.fenceLengthM && input.fenceLengthM > 0)
     segs.push(`フェンス延長: ${input.fenceLengthM.toFixed(1)}m`);
   if (stringing)
     segs.push(
@@ -125,24 +126,24 @@ function renderToCanvas(input: PdfRenderInput): HTMLCanvasElement {
     ctx.globalAlpha = 1;
   }
 
-  // 敷地境界線（オレンジ）
-  if (input.sitePolyPx.length >= 2) {
-    ctx.strokeStyle = "#caa21a";
-    ctx.lineWidth = 2;
+  // 敷地境界線（オレンジ）。区画ごとに描く。
+  ctx.strokeStyle = "#caa21a";
+  ctx.lineWidth = 2;
+  for (const poly of input.sitePolysPx) {
+    if (poly.length < 2) continue;
     ctx.beginPath();
-    input.sitePolyPx.forEach((p, i) =>
-      i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)
-    );
+    poly.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
     ctx.closePath();
     ctx.stroke();
   }
 
-  // フェンスライン（緑・野立てのみ）
-  if (input.fenceM && input.fenceM.length >= 2) {
-    ctx.strokeStyle = "#1f9d4d";
-    ctx.lineWidth = 2;
+  // フェンスライン（緑・野立てのみ）。区画ごとに描く。
+  ctx.strokeStyle = "#1f9d4d";
+  ctx.lineWidth = 2;
+  for (const fence of input.fencesM ?? []) {
+    if (!fence || fence.length < 2) continue;
     ctx.beginPath();
-    input.fenceM.forEach((p, i) => {
+    fence.forEach((p, i) => {
       const q = mToPx(p, mPerPx);
       i === 0 ? ctx.moveTo(q.x, q.y) : ctx.lineTo(q.x, q.y);
     });

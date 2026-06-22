@@ -5,9 +5,17 @@
 import type { Vec2 } from "./geometry";
 import type { LoadedImage } from "./imageLoader";
 
+/** 区画1つぶんの保存データ（多角形＋手動編集。自動配置結果は保存せず再生成する） */
+export interface SavedZone {
+  polyPts: Vec2[]; // 多角形（画像px）
+  polyClosed: boolean;
+  manual: Vec2[][]; // 手動追加パネル（数学m・4隅）
+  deleted: string[]; // 削除キー（"a{ai}_{pi}" / "m{idx}"）
+}
+
 export interface ProjectData {
-  /** フォーマット版数（将来の互換用） */
-  version: 1;
+  /** フォーマット版数。1=単一区画（旧）, 2=複数区画 */
+  version: 1 | 2;
   savedAt: string;
   /** 背景画像（dataURL）。未読込なら null */
   imageDataUrl: string | null;
@@ -16,9 +24,11 @@ export interface ProjectData {
   mPerPx: number;
   lat: number | null;
   lon: number | null;
-  /** 敷地多角形（画像px） */
-  polyPts: Vec2[];
-  polyClosed: boolean;
+  /** 複数区画（v2）。 */
+  zones?: SavedZone[];
+  /** 敷地多角形（v1・旧形式の後方互換） */
+  polyPts?: Vec2[];
+  polyClosed?: boolean;
   /** パワコン（画像px位置＋諸元） */
   pccList: { px: Vec2; ns: number; np: number; mppt: number }[];
   /** 先方柱の位置（画像px・任意） */
@@ -69,11 +79,15 @@ export function downloadProject(data: ProjectData, filename: string) {
   URL.revokeObjectURL(url);
 }
 
-/** プロジェクトJSONを読み込み（最低限の検証つき） */
+/** プロジェクトJSONを読み込み（最低限の検証つき。v1/v2 両対応） */
 export async function readProjectFile(file: File): Promise<ProjectData> {
   const text = await file.text();
   const data = JSON.parse(text) as ProjectData;
-  if (!data || data.version !== 1 || !Array.isArray(data.polyPts) || typeof data.inputs !== "object")
-    throw new Error("プロジェクトファイルの形式が正しくありません。");
+  const ok =
+    data &&
+    (data.version === 1 || data.version === 2) &&
+    typeof data.inputs === "object" &&
+    (Array.isArray(data.zones) || Array.isArray(data.polyPts));
+  if (!ok) throw new Error("プロジェクトファイルの形式が正しくありません。");
   return data;
 }

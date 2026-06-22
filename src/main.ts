@@ -1,4 +1,6 @@
 // UI 統合とステップ進行。各モジュールを束ねて配置図生成〜DXF出力まで行う。
+// 複数区画（最大いくつでも）を描き、各区画ごとに自動配置し、生成後は手動で
+// パネルを1枚ずつ追加／削除できる。出力（PDF/DXF/結線）は全区画を統合して扱う。
 import { CanvasView, ImgPoint } from "./canvas";
 import { loadSiteImage } from "./imageLoader";
 import { metersPerPixel, calibrateFromCoords, CoordRef } from "./calibration";
@@ -12,14 +14,26 @@ import {
   layoutPatternB,
   layoutRoofSingle,
   layoutFlushRoof,
+  unifiedRackFacing,
   LayoutInput,
   LayoutResult,
+  LayoutGrid,
+  ArrayTable,
   ColumnMode,
   Orientation,
 } from "./layout";
-import { formatResultHtml } from "./summary";
 import { buildDxf, downloadDxf } from "./dxfExport";
-import { Vec2, insetPolygon, polygonPerimeter } from "./geometry";
+import {
+  Vec2,
+  insetPolygon,
+  polygonPerimeter,
+  add,
+  scale,
+  sub,
+  dot,
+  normalize,
+  pointInPolygon,
+} from "./geometry";
 import {
   generateStringing,
   StringingResult,
@@ -29,6 +43,7 @@ import {
 import { buildAndDownloadPdf } from "./pdfExport";
 import {
   ProjectData,
+  SavedZone,
   bitmapToDataUrl,
   loadImageFromDataUrl,
   downloadProject,
@@ -39,7 +54,32 @@ const inp = (id: string) => document.getElementById(id) as HTMLInputElement;
 const sel = (id: string) => document.getElementById(id) as HTMLSelectElement;
 const el = (id: string) => document.getElementById(id)!;
 
-type Mode = "idle" | "calib" | "poly" | "koref" | "pcc" | "pole";
+type Mode = "idle" | "calib" | "poly" | "koref" | "pcc" | "pole" | "padd" | "pdel";
+
+/** 1区画＝1つの敷地（屋根）多角形＋その自動配置結果＋手動編集 */
+interface Zone {
+  polyPts: Vec2[]; // 多角形（画像px）
+  polyClosed: boolean;
+  result: LayoutResult | null; // 自動配置（設置タイプごとに1案）
+  grid: LayoutGrid | null; // 手動増設の吸着用グリッド
+  manual: Vec2[][]; // 手動追加パネル（数学m・4隅）
+  deleted: string[]; // 削除キー（自動="a{ai}_{pi}" / 手動="m{idx}"）
+  fenceM: Vec2[] | null; // フェンスライン（数学m・野立てのみ）
+  fenceLengthM: number; // フェンス延長(周長, m)
+}
+
+function newZone(): Zone {
+  return {
+    polyPts: [],
+    polyClosed: false,
+    result: null,
+    grid: null,
+    manual: [],
+    deleted: [],
+    fenceM: null,
+    fenceLengthM: 0,
+  };
+}
 
 const state = {
   loaded: false,
@@ -47,40 +87,174 @@ const state = {
   mPerPx: 0,
   calibPts: [] as Vec2[],
   korefPts: [] as Vec2[],
-  polyPts: [] as Vec2[],
-  polyClosed: false,
+  // ---- 複数区画 ----
+  zones: [] as Zone[],
+  activeZoneIdx: -1,
   hover: null as Vec2 | null,
   mode: "idle" as Mode,
   lat: NaN,
   lon: NaN,
-  results: null as LayoutResult[] | null,
-  previewIdx: 0,
-  // ---- ストリング結線 ----
-  // パワコン（画像px位置＋諸元）。直列/並列/MPPTは台ごとに保持。
+  // ---- ストリング結線（全区画統合に対して引く） ----
   pccList: [] as { px: Vec2; ns: number; np: number; mppt: number }[],
   polePx: null as Vec2 | null, // 先方柱の位置（画像px）
   stringing: null as StringingResult | null,
-  // フェンスライン（数学m・閉ポリゴン／野立てのみ。境界離隔ぶん内側）。
-  fencePolyM: null as Vec2[] | null,
-  fenceLengthM: 0, // フェンス延長(周長, m)
 };
 
 const view = new CanvasView(document.getElementById("canvas") as HTMLCanvasElement);
 const status = (msg: string) => (el("statusbar").innerHTML = msg);
+
+function activeZone(): Zone | null {
+  return state.activeZoneIdx >= 0 && state.activeZoneIdx < state.zones.length
+    ? state.zones[state.activeZoneIdx]
+    : null;
+}
+
+// ---------- 幾何ヘルパー ----------
+function centroid(rect: Vec2[]): Vec2 {
+  let x = 0, y = 0;
+  for (const p of rect) {
+    x += p.x;
+    y += p.y;
+  }
+  return { x: x / rect.length, y: y / rect.length };
+}
+
+/** 区画の多角形を数学m座標で返す */
+function zonePolyM(z: Zone): Vec2[] {
+  return imgToMeters(z.polyPts, state.mPerPx);
+}
+
+function isZoneEdited(z: Zone): boolean {
+  return z.manual.length > 0 || z.deleted.length > 0;
+}
+
+/** 区画の「現在有効な」パネル矩形（自動−削除＋手動）を返す（数学m） */
+function effectivePanels(z: Zone): Vec2[][] {
+  const del = new Set(z.deleted);
+  const out: Vec2[][] = [];
+  if (z.result) {
+    z.result.arrays.forEach((a, ai) =>
+      a.panelRects.forEach((rect, pi) => {
+        if (!del.has(`a${ai}_${pi}`)) out.push(rect);
+      })
+    );
+  }
+  z.manual.forEach((rect, mi) => {
+    if (!del.has(`m${mi}`)) out.push(rect);
+  });
+  return out;
+}
+
+function zonePanelCount(z: Zone): number {
+  return effectivePanels(z).length;
+}
+
+/** u,v 範囲からアレイ外形4隅を作る */
+function boundingCorners(rects: Vec2[][], uUnit: Vec2, vUnit: Vec2): Vec2[] {
+  let uMin = Infinity, uMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+  for (const r of rects)
+    for (const p of r) {
+      const u = dot(p, uUnit), v = dot(p, vUnit);
+      if (u < uMin) uMin = u;
+      if (u > uMax) uMax = u;
+      if (v < vMin) vMin = v;
+      if (v > vMax) vMax = v;
+    }
+  const toWorld = (u: number, v: number): Vec2 => add(scale(uUnit, u), scale(vUnit, v));
+  return [toWorld(uMin, vMin), toWorld(uMax, vMin), toWorld(uMax, vMax), toWorld(uMin, vMax)];
+}
+
+/**
+ * 区画の「出力・結線用」アレイ配列を返す。
+ * - 手動編集なし: 自動結果の arrays をそのまま使う（従来どおりの結線品質を維持）。
+ * - 手動編集あり: 有効パネルを段(v帯)ごとにまとめて再グループ化（編集後の近似結線）。
+ */
+function zoneEffectiveArrays(z: Zone): ArrayTable[] {
+  if (!z.result) return [];
+  if (!isZoneEdited(z)) return z.result.arrays;
+  const rects = effectivePanels(z);
+  if (rects.length === 0) return [];
+  const g = z.grid;
+  let uUnit: Vec2, vUnit: Vec2, subDepth: number;
+  if (g) {
+    uUnit = g.uUnit;
+    vUnit = g.vUnit;
+    subDepth = g.subDepth;
+  } else if (z.result.arrays.length > 0) {
+    const c = z.result.arrays[0].corners;
+    uUnit = normalize(sub(c[1], c[0]));
+    vUnit = normalize(sub(c[3], c[0]));
+    subDepth = Math.max(z.result.groundDepthM / Math.max(1, z.result.arrays[0].rows), 0.5);
+  } else {
+    return rects.map((r) => ({ corners: r, panelRects: [r], cols: 1, rows: 1, panels: 1 }));
+  }
+  const step = Math.max(subDepth, 0.01);
+  const bands = new Map<number, { rect: Vec2[]; u: number }[]>();
+  for (const rect of rects) {
+    const c = centroid(rect);
+    const key = Math.round(dot(c, vUnit) / step);
+    const arr = bands.get(key) ?? [];
+    arr.push({ rect, u: dot(c, uUnit) });
+    bands.set(key, arr);
+  }
+  const out: ArrayTable[] = [];
+  for (const [, list] of [...bands.entries()].sort((a, b) => a[0] - b[0])) {
+    list.sort((a, b) => a.u - b.u);
+    const panelRects = list.map((x) => x.rect);
+    out.push({
+      corners: boundingCorners(panelRects, uUnit, vUnit),
+      panelRects,
+      cols: panelRects.length,
+      rows: 1,
+      panels: panelRects.length,
+    });
+  }
+  return out;
+}
+
+/** 全区画を統合した1つの LayoutResult（PDF/DXF/結線で使用）。配置がなければ null */
+function combinedResult(): LayoutResult | null {
+  const zs = state.zones.filter((z) => z.result);
+  if (zs.length === 0) return null;
+  const base = zs[0].result!;
+  let arrays: ArrayTable[] = [];
+  for (const z of zs) arrays = arrays.concat(zoneEffectiveArrays(z));
+  const totalPanels = arrays.reduce((s, a) => s + a.panels, 0);
+  const watt = parseFloat(inp("pWatt").value) || 0;
+  const breakdown: Record<number, number> = {};
+  for (const a of arrays) breakdown[a.cols] = (breakdown[a.cols] ?? 0) + 1;
+  return {
+    ...base,
+    arrays,
+    totalPanels,
+    totalKw: (totalPanels * watt) / 1000,
+    colCountBreakdown: breakdown,
+  };
+}
+
+/** 全区画の多角形（画像px）と、フェンス（数学m）を配列で返す */
+function allSitePolysPx(): Vec2[][] {
+  return state.zones.filter((z) => z.polyClosed).map((z) => z.polyPts);
+}
+function allFencesM(): (Vec2[] | null)[] {
+  return state.zones.filter((z) => z.result).map((z) => z.fenceM);
+}
+function totalFenceLengthM(): number {
+  return state.zones.filter((z) => z.result).reduce((s, z) => s + z.fenceLengthM, 0);
+}
 
 // ---------- オーバーレイ描画 ----------
 view.onOverlay = (ctx) => {
   const s = view.pxScale || 1;
   const lw = 1.5 / s;
 
-  // 配置アレイ（プレビュー）：パネル1枚ごとに罫線（線=青・塗り=水色）
-  if (state.results && state.results[state.previewIdx] && state.mPerPx > 0) {
-    const r = state.results[state.previewIdx];
-    ctx.fillStyle = "rgba(135,206,250,0.55)"; // 水色
-    ctx.strokeStyle = "#1565d8"; // 青
+  // 各区画のパネル（自動＋手動）。線=青・塗り=水色
+  if (state.mPerPx > 0) {
+    ctx.fillStyle = "rgba(135,206,250,0.55)";
+    ctx.strokeStyle = "#1565d8";
     ctx.lineWidth = lw * 0.8;
-    for (const a of r.arrays) {
-      for (const rect of a.panelRects) {
+    for (const z of state.zones) {
+      for (const rect of effectivePanels(z)) {
         ctx.beginPath();
         rect.forEach((c, i) => {
           const p = metersToImg(c, state.mPerPx);
@@ -93,7 +267,7 @@ view.onOverlay = (ctx) => {
     }
   }
 
-  // ストリング結線（プレビュー）。PCSごとに色分けし、直列順にパネル中心を結ぶ。
+  // ストリング結線（全区画統合）。PCSごとに色分けし、直列順にパネル中心を結ぶ。
   if (state.stringing && state.mPerPx > 0) {
     for (const str of state.stringing.strings) {
       ctx.strokeStyle = pcsColor(str.pcsIndex).hex;
@@ -137,38 +311,48 @@ view.onOverlay = (ctx) => {
     ctx.fillText("先方柱", state.polePx.x + 8 / s, state.polePx.y - 4 / s);
   }
 
-  // フェンスライン（緑・野立てのみ）。境界離隔ぶん内側の閉ポリゴン。
-  if (state.fencePolyM && state.fencePolyM.length >= 2 && state.mPerPx > 0) {
+  // フェンスライン（緑・野立てのみ）。各区画ぶん。
+  if (state.mPerPx > 0) {
     ctx.strokeStyle = "#22c55e";
     ctx.lineWidth = lw * 1.2;
-    ctx.beginPath();
-    state.fencePolyM.forEach((p, i) => {
-      const q = metersToImg(p, state.mPerPx);
-      i === 0 ? ctx.moveTo(q.x, q.y) : ctx.lineTo(q.x, q.y);
-    });
-    ctx.closePath();
-    ctx.stroke();
+    for (const z of state.zones) {
+      if (!z.fenceM || z.fenceM.length < 2) continue;
+      ctx.beginPath();
+      z.fenceM.forEach((p, i) => {
+        const q = metersToImg(p, state.mPerPx);
+        i === 0 ? ctx.moveTo(q.x, q.y) : ctx.lineTo(q.x, q.y);
+      });
+      ctx.closePath();
+      ctx.stroke();
+    }
   }
 
-  // 敷地多角形
-  if (state.polyPts.length > 0) {
-    ctx.strokeStyle = "#ffcf3a";
-    ctx.lineWidth = lw * 1.4;
+  // 各区画の多角形（アクティブ区画は明るい黄、それ以外は控えめ）
+  state.zones.forEach((z, idx) => {
+    if (z.polyPts.length === 0) return;
+    const isActive = idx === state.activeZoneIdx;
+    ctx.strokeStyle = isActive ? "#ffcf3a" : "#b89321";
+    ctx.lineWidth = lw * (isActive ? 1.6 : 1.2);
     ctx.beginPath();
-    state.polyPts.forEach((p, i) =>
-      i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)
-    );
-    if (state.mode === "poly" && state.hover && !state.polyClosed)
+    z.polyPts.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    if (isActive && state.mode === "poly" && state.hover && !z.polyClosed)
       ctx.lineTo(state.hover.x, state.hover.y);
-    if (state.polyClosed) ctx.closePath();
+    if (z.polyClosed) ctx.closePath();
     ctx.stroke();
-    ctx.fillStyle = "#ffcf3a";
-    for (const p of state.polyPts) {
+    ctx.fillStyle = isActive ? "#ffcf3a" : "#b89321";
+    for (const p of z.polyPts) {
       ctx.beginPath();
       ctx.arc(p.x, p.y, 4 / s, 0, Math.PI * 2);
       ctx.fill();
     }
-  }
+    // 区画番号ラベル
+    if (z.polyPts.length > 0) {
+      const c = centroid(z.polyPts);
+      ctx.fillStyle = isActive ? "#ffcf3a" : "#c9a93a";
+      ctx.font = `bold ${14 / s}px sans-serif`;
+      ctx.fillText(`区画${idx + 1}`, c.x, c.y);
+    }
+  });
 
   // 公図基準点
   if (state.korefPts.length > 0) {
@@ -228,15 +412,17 @@ view.onClick = (p: ImgPoint) => {
     }
     view.render();
   } else if (state.mode === "poly") {
-    if (state.polyClosed) {
-      state.polyPts = [];
-      state.polyClosed = false;
+    const z = activeZone();
+    if (!z) return;
+    if (z.polyClosed) {
+      // 閉合済みの区画に再クリック＝この区画を引き直す
+      z.polyPts = [];
+      z.polyClosed = false;
     }
-    state.polyPts.push(p);
-    updatePolyStatus();
+    z.polyPts.push(p);
+    renderZoneList();
     view.render();
   } else if (state.mode === "pcc") {
-    // クリックごとにパワコンを追加（複数台対応）。既定の直列/並列/MPPTを付与。
     state.pccList.push({ px: p, ...defaultPccSpec() });
     updatePccStatus();
     renderPccList();
@@ -247,6 +433,10 @@ view.onClick = (p: ImgPoint) => {
     state.mode = "idle";
     status("先方柱の位置を設定しました（灰色の丸で表記されます）。");
     view.render();
+  } else if (state.mode === "padd") {
+    handleAddPanel(p);
+  } else if (state.mode === "pdel") {
+    handleDeletePanel(p);
   }
 };
 
@@ -289,7 +479,6 @@ function renderPccList() {
       );
     })
     .join("");
-  // 入力変更
   host.querySelectorAll<HTMLInputElement>("input[data-k]").forEach((inpEl) => {
     inpEl.addEventListener("change", () => {
       const row = inpEl.closest(".pcc-row") as HTMLElement;
@@ -299,7 +488,6 @@ function renderPccList() {
       renderPccList();
     });
   });
-  // 個別削除
   host.querySelectorAll<HTMLButtonElement>("button[data-del]").forEach((btn) => {
     btn.addEventListener("click", () => {
       state.pccList.splice(parseInt(btn.dataset.del!), 1);
@@ -342,8 +530,8 @@ el("calibApply").addEventListener("click", () => {
   try {
     state.mPerPx = metersPerPixel(state.calibPts[0], state.calibPts[1], dist);
     el("calibStatus").innerHTML = `<span class="ok">校正済: ${(state.mPerPx * 1000).toFixed(2)} mm/px</span>`;
-    status("敷地を多角形で囲んでください。");
-    updatePolyStatus();
+    status("「区画を追加」を押して敷地（屋根）を多角形で囲んでください。");
+    renderZoneList();
   } catch (err) {
     el("calibStatus").innerHTML = `<span class="err">${(err as Error).message}</span>`;
   }
@@ -394,7 +582,6 @@ el("kouzuApply").addEventListener("click", () => {
     state.mPerPx = mPerPx;
     inp("northAngle").value = northAngleDeg.toFixed(2);
 
-    // 座標系番号から緯度経度を逆算（2点の中点を使用）
     const zone = parseInt(sel("jprZone").value);
     const midX = (ref1.xNorth + ref2.xNorth) / 2;
     const midY = (ref1.yEast + ref2.yEast) / 2;
@@ -406,56 +593,98 @@ el("kouzuApply").addEventListener("click", () => {
     el("geoStatus").innerHTML = `<span class="ok">公図座標から自動設定: 緯度${lat.toFixed(4)}, 経度${lon.toFixed(4)}</span>`;
 
     el("calibStatus").innerHTML = `<span class="ok">公図座標で校正: ${(mPerPx * 1000).toFixed(2)} mm/px / 北方向 ${northAngleDeg.toFixed(1)}°</span>`;
-    status("校正完了（縮尺・北方向・緯度経度を自動設定）。敷地を多角形で囲んでください。");
-    updatePolyStatus();
+    status("校正完了。「区画を追加」を押して敷地（屋根）を多角形で囲んでください。");
+    renderZoneList();
   } catch (err) {
     el("calibStatus").innerHTML = `<span class="err">${(err as Error).message}</span>`;
   }
 });
 
-// ---------- 3. 敷地多角形 ----------
-el("polyStart").addEventListener("click", () => {
+// ---------- 3. 区画（複数の敷地多角形） ----------
+el("zoneAdd").addEventListener("click", () => {
   if (!state.loaded) return status("先に敷地図を読み込んでください。");
+  state.zones.push(newZone());
+  state.activeZoneIdx = state.zones.length - 1;
   state.mode = "poly";
-  state.polyPts = [];
-  state.polyClosed = false;
+  renderZoneList();
   view.render();
-  status("クリックで頂点を追加し、最後に「閉じる」を押してください。");
+  status(`区画${state.zones.length}を作図中。クリックで頂点を追加し、「この区画を閉じる」を押してください。`);
 });
+
 el("polyUndo").addEventListener("click", () => {
-  state.polyPts.pop();
-  state.polyClosed = false;
-  updatePolyStatus();
+  const z = activeZone();
+  if (!z) return;
+  z.polyPts.pop();
+  z.polyClosed = false;
+  renderZoneList();
   view.render();
 });
+
 el("polyClose").addEventListener("click", () => {
+  const z = activeZone();
+  if (!z) return status("先に「区画を追加」で区画を作成してください。");
   // 始点付近で閉じた場合の余分な終点を除去し、始点＝終点として閉じる
-  // （残すとフェンスライン等の内側オフセットがスパイク化するため）。
-  const pts = state.polyPts;
+  const pts = z.polyPts;
   if (pts.length >= 4) {
     const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
     const diag = Math.hypot(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys));
     const first = pts[0], last = pts[pts.length - 1];
     if (Math.hypot(last.x - first.x, last.y - first.y) < diag * 0.02) pts.pop();
   }
-  if (state.polyPts.length < 3) return status("頂点が3つ以上必要です。");
-  state.polyClosed = true;
+  if (z.polyPts.length < 3) return status("頂点が3つ以上必要です。");
+  z.polyClosed = true;
   state.mode = "idle";
-  updatePolyStatus();
+  renderZoneList();
   view.render();
+  status(`区画${state.activeZoneIdx + 1}を閉じました。別の場所も囲むなら「区画を追加」、配置するなら「配置を生成」。`);
 });
 
-function updatePolyStatus() {
-  const n = state.polyPts.length;
-  if (n === 0) return (el("polyStatus").textContent = "未作図");
-  let txt = `頂点 ${n} 点${state.polyClosed ? "（閉合）" : ""}`;
-  if (state.polyClosed && state.mPerPx > 0) {
-    const area = polygonAreaM2(state.polyPts, state.mPerPx);
-    txt += ` / 面積 ${area.toLocaleString(undefined, { maximumFractionDigits: 0 })} m²`;
+/** 区画一覧を描画（選択・削除） */
+function renderZoneList() {
+  const host = el("zoneList");
+  if (state.zones.length === 0) {
+    host.innerHTML = `<div class="hint">未作図（「区画を追加」で開始）</div>`;
+    return;
   }
-  el("polyStatus").innerHTML = state.polyClosed
-    ? `<span class="ok">${txt}</span>`
-    : txt;
+  host.innerHTML = state.zones
+    .map((z, i) => {
+      const active = i === state.activeZoneIdx;
+      const cnt = z.result ? zonePanelCount(z) : 0;
+      let info = z.polyClosed ? "閉合" : `作図中(${z.polyPts.length}点)`;
+      if (z.polyClosed && state.mPerPx > 0) {
+        const area = polygonAreaM2(z.polyPts, state.mPerPx);
+        info += ` / ${area.toLocaleString(undefined, { maximumFractionDigits: 0 })}m²`;
+      }
+      if (z.result) info += ` / ${cnt}枚`;
+      return (
+        `<div style="display:flex;align-items:center;gap:6px;margin:3px 0;padding:3px 5px;border-radius:4px;${active ? "background:#2d3a66" : ""}">` +
+        `<button data-sel="${i}" class="secondary" style="flex:1;text-align:left;margin:0;padding:3px 6px;font-size:12px">` +
+        `区画${i + 1}${active ? "（選択中）" : ""}: ${info}</button>` +
+        `<button data-del="${i}" class="secondary" style="margin:0;padding:3px 8px">×</button>` +
+        `</div>`
+      );
+    })
+    .join("");
+  host.querySelectorAll<HTMLButtonElement>("button[data-sel]").forEach((b) => {
+    b.addEventListener("click", () => {
+      state.activeZoneIdx = parseInt(b.dataset.sel!);
+      renderZoneList();
+      view.render();
+      status(`区画${state.activeZoneIdx + 1}を選択しました。`);
+    });
+  });
+  host.querySelectorAll<HTMLButtonElement>("button[data-del]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const i = parseInt(b.dataset.del!);
+      state.zones.splice(i, 1);
+      if (state.activeZoneIdx >= state.zones.length) state.activeZoneIdx = state.zones.length - 1;
+      state.stringing = null;
+      el("pipeResults").innerHTML = "";
+      renderZoneList();
+      refreshResultsSummary();
+      view.render();
+    });
+  });
 }
 
 // ---------- 4. ジオコーディング ----------
@@ -526,7 +755,7 @@ function readPanel(): PanelSpec {
 // ---------- 6. 設置タイプ切替 ----------
 const mountHints: Record<string, string> = {
   ground: "野立て：傾斜角＋冬至の影離隔で配置（A=真南／B=敷地なり）。",
-  roof_rack: "陸屋根：合掌（東西・背中合わせ）の山型。片側1枚×2スロープ、山と山＝固定離隔、横列間＝20mm。影計算・住所は不要。屋根なり1パターン。",
+  roof_rack: "陸屋根：合掌（背中合わせ）の山型。常に横置き・片側1枚×2スロープ。「合掌の向き」で東西向き／南北向き（90度回転）を選択。影計算・住所は不要。",
   roof_flush: "傾斜屋根：パネルを寝かせ影離隔なしで密に配置。屋根なり1パターン。傾斜角・住所は不要。",
 };
 /** UI選択 → エンジンの設置方式 */
@@ -539,6 +768,9 @@ sel("mountType").addEventListener("change", () => {
   const mt = engineMountType();
   el("roofFlushBox").style.display = mt === "flush" ? "block" : "none";
   el("roofRackBox").style.display = mt === "rack" ? "block" : "none";
+  el("groundPatternBox").style.display = mt === "tilted" ? "block" : "none";
+  // 陸屋根はパネル向き（縦/横）の代わりに「合掌の向き」を使うため、向き・段数の行を隠す。
+  el("orientTierRow").style.display = mt === "rack" ? "none" : "flex";
 });
 
 // ---------- 6. 列数モード切替 ----------
@@ -559,24 +791,49 @@ function readColumnMode(): ColumnMode {
 }
 
 function patternLabel(r: LayoutResult): string {
-  if (r.pattern === "A") return "パターンA（真南）";
-  if (r.pattern === "B") return "パターンB（敷地/屋根なり）";
-  return r.mountType === "rack" ? "陸屋根（合掌・東西）" : "傾斜屋根（フラッシュ）";
+  if (r.pattern === "A") return "真南設置";
+  if (r.pattern === "B") return "敷地なり";
+  return r.mountType === "rack" ? "陸屋根（合掌）" : "傾斜屋根（フラッシュ）";
 }
 
-// ---------- 7. 生成 ----------
+/** 共有設定から、指定多角形（数学m）に対する LayoutInput を組む */
+function buildLayoutInput(polygonM: Vec2[], sun: ReturnType<typeof getWinterSunPositions>): LayoutInput {
+  const manualPitchRaw = parseFloat(inp("manualPitch").value);
+  return {
+    polygonM,
+    panel: readPanel(),
+    orientation: sel("orientation").value as Orientation,
+    rackDir: (sel("rackDir").value as "ew" | "ns") || "ew",
+    tiers: parseInt(inp("tiers").value) || 1,
+    columnMode: readColumnMode(),
+    tiltDeg: parseFloat(inp("tilt").value) || 0,
+    setbackM: parseFloat(inp("setback").value) || 0,
+    colGapM: parseFloat(inp("colGap").value) || 0,
+    sideGapM: parseFloat(inp("sideGap").value) || 0,
+    northAngleDeg: parseFloat(inp("northAngle").value) || 0,
+    sun,
+    manualPitchM: Number.isFinite(manualPitchRaw) ? manualPitchRaw : undefined,
+    mountType: engineMountType(),
+    rowGapM: parseFloat(inp("roofRowGap").value) || 0.02,
+    mountainGapM: parseFloat(inp("mountainGap").value) || 0.25,
+    flushRows: parseInt(inp("flushRows").value) || undefined,
+    flushCols: parseInt(inp("flushCols").value) || undefined,
+    setbackEWm: parseFloat(inp("flushSetbackEW").value) || 0,
+    setbackNSm: parseFloat(inp("flushSetbackNS").value) || 0,
+  };
+}
+
+// ---------- 7. 生成（全区画） ----------
 el("generateBtn").addEventListener("click", () => {
   if (!state.loaded) return status("敷地図を読み込んでください。");
   if (state.mPerPx <= 0) return status("縮尺を校正してください。");
-  if (!state.polyClosed || state.polyPts.length < 3)
-    return status("敷地（屋根）多角形を閉じてください。");
+  const closed = state.zones.filter((z) => z.polyClosed && z.polyPts.length >= 3);
+  if (closed.length === 0) return status("区画を1つ以上、多角形で閉じてください。");
 
-  const mountType = engineMountType(); // tilted | rack | flush
-
+  const mountType = engineMountType();
   syncLatLon();
-  // tilted（野立て）のみ影離隔に緯度経度が必要。rack/flush（屋根）は不要。
   if (mountType === "tilted" && (!Number.isFinite(state.lat) || !Number.isFinite(state.lon)))
-    return status("緯度経度（または住所）を設定してください。");
+    return status("野立ては緯度経度（または住所）を設定してください。");
 
   const panel = readPanel();
   if (!Number.isFinite(panel.widthMm) || !Number.isFinite(panel.heightMm) || !Number.isFinite(panel.wattW))
@@ -585,129 +842,268 @@ el("generateBtn").addEventListener("click", () => {
   if (mode.kind === "specified" && mode.cols.length === 0)
     return status("指定列数を1つ以上入力してください。");
 
-  const sun =
-    mountType === "tilted" ? getWinterSunPositions(state.lat, state.lon) : [];
+  const sun = mountType === "tilted" ? getWinterSunPositions(state.lat, state.lon) : [];
   if (mountType === "tilted" && sun.length === 0)
     status("注意: 冬至10-14時に太陽が地平線上に出ません（高緯度）。離隔は0で計算します。");
 
-  const manualPitchRaw = parseFloat(inp("manualPitch").value);
-  const input: LayoutInput = {
-    polygonM: imgToMeters(state.polyPts, state.mPerPx),
-    panel,
-    orientation: sel("orientation").value as Orientation,
-    tiers: parseInt(inp("tiers").value) || 1,
-    columnMode: mode,
-    tiltDeg: parseFloat(inp("tilt").value) || 0,
-    setbackM: parseFloat(inp("setback").value) || 0,
-    colGapM: parseFloat(inp("colGap").value) || 0,
-    sideGapM: parseFloat(inp("sideGap").value) || 0,
-    northAngleDeg: parseFloat(inp("northAngle").value) || 0,
-    sun,
-    manualPitchM: Number.isFinite(manualPitchRaw) ? manualPitchRaw : undefined,
-    mountType,
-    rowGapM: parseFloat(inp("roofRowGap").value) || 0.02,
-    mountainGapM: parseFloat(inp("mountainGap").value) || 0.25,
-    flushRows: parseInt(inp("flushRows").value) || undefined,
-    flushCols: parseInt(inp("flushCols").value) || undefined,
-    setbackEWm: parseFloat(inp("flushSetbackEW").value) || 0,
-    setbackNSm: parseFloat(inp("flushSetbackNS").value) || 0,
-  };
-
-  // フェンスライン（野立てのみ）：敷地境界から境界離隔ぶん内側の閉ポリゴン。
-  state.fencePolyM =
-    mountType === "tilted" && input.setbackM > 0
-      ? insetPolygon(input.polygonM, input.setbackM)
-      : null;
-  state.fenceLengthM = state.fencePolyM ? polygonPerimeter(state.fencePolyM) : 0;
-
+  const groundPat = sel("groundPattern").value; // "B" | "A"
   status("配置を計算中...");
   setTimeout(() => {
-    const list: LayoutResult[] =
-      mountType === "tilted"
-        ? [layoutPatternA(input), layoutPatternB(input)]
-        : mountType === "rack"
-          ? [layoutRoofSingle(input)]
-          : [layoutFlushRoof(input)];
-    showResults(list);
-    const fenceMsg = state.fenceLengthM > 0 ? ` ／ フェンス延長 ${state.fenceLengthM.toFixed(1)}m` : "";
-    status("生成完了: " + list.map((r) => `${patternLabel(r)}=${r.totalPanels}枚(${r.totalKw.toFixed(1)}kW)`).join(" / ") + fenceMsg);
+    const targets = state.zones.filter((z) => z.polyClosed && z.polyPts.length >= 3);
+    const inputs = targets.map((z) => buildLayoutInput(zonePolyM(z), sun));
+    // 複数区画の陸屋根は、東西の振れ（合掌の向き）を全区画で統一する。
+    let unifiedFacing: number | null = null;
+    if (mountType === "rack" && inputs.length > 1) {
+      unifiedFacing = unifiedRackFacing(inputs);
+    }
+    targets.forEach((z, i) => {
+      const input = inputs[i];
+      if (mountType === "rack" && unifiedFacing != null) input.forcedFacing = unifiedFacing;
+      const res =
+        mountType === "tilted"
+          ? groundPat === "A"
+            ? layoutPatternA(input)
+            : layoutPatternB(input)
+          : mountType === "rack"
+            ? layoutRoofSingle(input)
+            : layoutFlushRoof(input);
+      z.result = res;
+      z.grid = res.grid ?? null;
+      z.fenceM =
+        mountType === "tilted" && input.setbackM > 0
+          ? insetPolygon(input.polygonM, input.setbackM)
+          : null;
+      z.fenceLengthM = z.fenceM ? polygonPerimeter(z.fenceM) : 0;
+      // 既存の手動編集は保持（同条件の再生成ならグリッドが一致するため整合する）
+    });
+    // 配置が変わったので結線はクリア（再生成を促す）
+    state.stringing = null;
+    el("pipeResults").innerHTML = "";
+    refreshResultsSummary();
+    renderZoneList();
+    view.render();
+    const fence = totalFenceLengthM();
+    const total = state.zones.reduce((s, z) => s + (z.result ? zonePanelCount(z) : 0), 0);
+    status(
+      `生成完了: ${closed.length}区画 / 合計 ${total}枚` +
+        (fence > 0 ? ` ／ フェンス延長 計${fence.toFixed(1)}m` : "")
+    );
   }, 20);
 });
 
-function showResults(list: LayoutResult[]) {
-  state.results = list;
-  state.previewIdx = 0;
-  const area = polygonAreaM2(state.polyPts, state.mPerPx);
-  el("results").innerHTML = list.map((r) => formatResultHtml(r, area)).join("");
-
-  // プレビュー切替（結果が2つ以上のときだけ表示）
-  const seg = el("previewSeg") as HTMLElement;
-  if (list.length > 1) {
-    seg.innerHTML = list
-      .map((r, i) => `<button data-i="${i}" class="${i === 0 ? "active" : ""}">${patternLabel(r)}</button>`)
-      .join("");
-    seg.style.display = "flex";
-    seg.querySelectorAll("button").forEach((b) =>
-      b.addEventListener("click", () => setPreview(parseInt((b as HTMLElement).dataset.i!)))
-    );
-  } else {
-    seg.innerHTML = "";
-    seg.style.display = "none";
-  }
-
-  // DXF出力の対象選択肢
-  sel("exportPattern").innerHTML = list
-    .map((r, i) => `<option value="${i}">${patternLabel(r)}</option>`)
-    .join("");
-
-  view.render();
+/** パネルの向き（facing方位）の、最寄り90°基準からの振れ角（度・(-45,45]）。区画間で一致＝角度統一。 */
+function gridAngleDev(r: LayoutResult): number {
+  let d = ((r.facingBearingDeg % 90) + 90) % 90;
+  if (d > 45) d -= 90;
+  return d;
 }
 
-function setPreview(idx: number) {
-  state.previewIdx = idx;
-  document.querySelectorAll("#previewSeg button").forEach((b) => {
-    b.classList.toggle("active", parseInt((b as HTMLElement).dataset.i!) === idx);
+/** 結果サマリ（区画別＋合計）を描画 */
+function refreshResultsSummary() {
+  const zs = state.zones.filter((z) => z.result);
+  if (zs.length === 0) {
+    el("results").innerHTML = "";
+    return;
+  }
+  const watt = parseFloat(inp("pWatt").value) || 0;
+  let totalPanels = 0;
+  let body = "";
+  const devs: number[] = [];
+  state.zones.forEach((z, i) => {
+    if (!z.result) return;
+    const cnt = zonePanelCount(z);
+    totalPanels += cnt;
+    const kw = (cnt * watt) / 1000;
+    const area = polygonAreaM2(z.polyPts, state.mPerPx);
+    const dev = gridAngleDev(z.result);
+    devs.push(dev);
+    const edited = isZoneEdited(z)
+      ? ` <span class="warn">(手動調整あり)</span>`
+      : "";
+    body +=
+      `<div class="result-card"><h3>区画${i + 1}：${patternLabel(z.result)}</h3>` +
+      `<div>パネル: <b>${cnt.toLocaleString()}枚</b> / <b>${kw.toFixed(1)}kW</b>${edited}</div>` +
+      `<div>配置角度: 基準から <b>${dev >= 0 ? "+" : ""}${dev.toFixed(1)}°</b></div>` +
+      `<div>面積: ${area.toLocaleString(undefined, { maximumFractionDigits: 0 })} m²</div>` +
+      `</div>`;
   });
+  const totalKw = (totalPanels * watt) / 1000;
+  // 全区画の配置角度が一致しているかチェック（東西の振れ統一の確認）
+  let angleLine = "";
+  if (devs.length > 1) {
+    const span = Math.max(...devs) - Math.min(...devs);
+    angleLine =
+      span < 0.05
+        ? `<div class="ok">東西の振れ: 全区画一致 ✓（基準から${devs[0] >= 0 ? "+" : ""}${devs[0].toFixed(1)}°）</div>`
+        : `<div class="warn">⚠ 区画間で配置角度が異なります（差 ${span.toFixed(1)}°）</div>`;
+  }
+  const head =
+    `<div class="result-card" style="border-color:#3a6df0">` +
+    `<h3>合計（${zs.length}区画）</h3>` +
+    `<div>パネル総数: <b>${totalPanels.toLocaleString()}枚</b> / <b>${totalKw.toFixed(1)}kW</b></div>` +
+    angleLine +
+    `</div>`;
+  el("results").innerHTML = head + body;
+}
+
+// ---------- 7.5 手動でパネル調整 ----------
+el("panelAddMode").addEventListener("click", () => {
+  if (state.zones.every((z) => !z.result)) return status("先に「配置を生成」してください。");
+  if (!activeZone()?.result)
+    return status("対象区画を一覧から選択してください（その区画にパネルを追加します）。");
+  state.mode = "padd";
+  setManualButtons();
+  status(`【追加モード】区画${state.activeZoneIdx + 1}の空きマスをクリックでパネル追加。`);
+});
+el("panelDelMode").addEventListener("click", () => {
+  if (state.zones.every((z) => !z.result)) return status("先に「配置を生成」してください。");
+  if (!activeZone()?.result)
+    return status("対象区画を一覧から選択してください（その区画のパネルを削除します）。");
+  state.mode = "pdel";
+  setManualButtons();
+  status(`【削除モード】区画${state.activeZoneIdx + 1}のパネルをクリックで削除。`);
+});
+el("manualDone").addEventListener("click", () => {
+  state.mode = "idle";
+  setManualButtons();
+  status("手動編集を終了しました。");
+});
+el("manualReset").addEventListener("click", () => {
+  const z = activeZone();
+  if (!z) return status("対象区画を選択してください。");
+  z.manual = [];
+  z.deleted = [];
+  state.stringing = null;
+  el("pipeResults").innerHTML = "";
+  refreshResultsSummary();
+  renderZoneList();
+  view.render();
+  status(`区画${state.activeZoneIdx + 1}の手動編集をリセットしました。`);
+});
+
+/** 追加/削除モードのボタン見た目を更新 */
+function setManualButtons() {
+  el("panelAddMode").classList.toggle("active-mode", state.mode === "padd");
+  el("panelDelMode").classList.toggle("active-mode", state.mode === "pdel");
+}
+
+/** クリック地点（画像px）にグリッド吸着でパネルを1枚追加 */
+function handleAddPanel(p: ImgPoint) {
+  const z = activeZone();
+  if (!z || !z.result || !z.grid) return status("対象区画を生成してから追加してください。");
+  const click = imgToMeters([p], state.mPerPx)[0];
+  const rect = snapPanelRect(z.grid, click, zonePolyM(z));
+  if (!rect) return status("この位置には配置できません（区画の外側です）。");
+  if (effectivePanels(z).some((r) => pointInPolygon(centroid(rect), r)))
+    return status("すでにパネルがあります。");
+  z.manual.push(rect);
+  onPanelsChanged();
+  status(`区画${state.activeZoneIdx + 1}にパネルを追加（計${zonePanelCount(z)}枚）。続けてクリックで追加。`);
+}
+
+/** クリック地点のパネルを削除（自動・手動どちらも） */
+function handleDeletePanel(p: ImgPoint) {
+  const z = activeZone();
+  if (!z) return;
+  const click = imgToMeters([p], state.mPerPx)[0];
+  const key = findPanelKeyAt(z, click);
+  if (!key) return status("パネルがありません（パネルの上をクリックしてください）。");
+  if (!z.deleted.includes(key)) z.deleted.push(key);
+  onPanelsChanged();
+  status(`区画${state.activeZoneIdx + 1}のパネルを削除（計${zonePanelCount(z)}枚）。続けてクリックで削除。`);
+}
+
+/** クリック地点にあるパネルのキー（"a{ai}_{pi}" / "m{idx}"）を返す */
+function findPanelKeyAt(z: Zone, c: Vec2): string | null {
+  const del = new Set(z.deleted);
+  if (z.result) {
+    for (let ai = 0; ai < z.result.arrays.length; ai++) {
+      const rects = z.result.arrays[ai].panelRects;
+      for (let pi = 0; pi < rects.length; pi++) {
+        const k = `a${ai}_${pi}`;
+        if (!del.has(k) && pointInPolygon(c, rects[pi])) return k;
+      }
+    }
+  }
+  for (let mi = 0; mi < z.manual.length; mi++) {
+    const k = `m${mi}`;
+    if (!del.has(k) && pointInPolygon(c, z.manual[mi])) return k;
+  }
+  return null;
+}
+
+/** グリッドへ吸着した1パネルの矩形を返す（区画外なら null） */
+function snapPanelRect(g: LayoutGrid, click: Vec2, polyM: Vec2[]): Vec2[] | null {
+  const u = dot(click, g.uUnit);
+  const v = dot(click, g.vUnit);
+  const col = Math.round((u - g.uOrigin - g.panelW / 2) / g.colPitch);
+  const uLeft = g.uOrigin + col * g.colPitch;
+  const toWorld = (uu: number, vv: number): Vec2 => add(scale(g.uUnit, uu), scale(g.vUnit, vv));
+  const bandEst = Math.round((v - g.vOrigin) / g.bandPitch);
+  let best: { rect: Vec2[]; d: number } | null = null;
+  for (let band = bandEst - 1; band <= bandEst + 1; band++) {
+    for (let s = 0; s < g.subCount; s++) {
+      const vBottom = g.vOrigin + band * g.bandPitch + s * g.subDepth;
+      const vCenter = vBottom + g.subDepth / 2;
+      const d = Math.abs(vCenter - v);
+      if (!best || d < best.d) {
+        best = {
+          d,
+          rect: [
+            toWorld(uLeft, vBottom),
+            toWorld(uLeft + g.panelW, vBottom),
+            toWorld(uLeft + g.panelW, vBottom + g.subDepth),
+            toWorld(uLeft, vBottom + g.subDepth),
+          ],
+        };
+      }
+    }
+  }
+  if (!best) return null;
+  const pts = [...best.rect, centroid(best.rect)];
+  if (!pts.every((pt) => pointInPolygon(pt, polyM))) return null;
+  return best.rect;
+}
+
+/** パネル集合が変わったときの共通処理（結線クリア＋再描画） */
+function onPanelsChanged() {
+  state.stringing = null;
+  el("pipeResults").innerHTML = "";
+  refreshResultsSummary();
+  renderZoneList();
   view.render();
 }
 
 // ---------- 8. DXF出力 ----------
 el("exportDxf").addEventListener("click", () => {
-  if (!state.results) return status("先に配置を生成してください。");
-  const idx = parseInt(sel("exportPattern").value) || 0;
-  const result = state.results[idx];
-  if (!result) return status("出力対象を選択してください。");
-  const siteM = imgToMeters(state.polyPts, state.mPerPx);
-  // 結線を含めるか（生成済みかつチェックON）
+  const result = combinedResult();
+  if (!result) return status("先に配置を生成してください。");
   const includeStr =
     !!(document.getElementById("dxfIncludePipe") as HTMLInputElement)?.checked && !!state.stringing;
-  const dxf = buildDxf(siteM, result, {
+  const dxf = buildDxf(allSitePolysPx().map((poly) => imgToMeters(poly, state.mPerPx)), result, {
     northAngleDeg: parseFloat(inp("northAngle").value) || 0,
     stringing: includeStr ? state.stringing! : undefined,
-    fence: state.fencePolyM,
-    fenceLengthM: state.fenceLengthM,
+    fences: allFencesM(),
+    fenceLengthM: totalFenceLengthM(),
     moduleLabel: moduleLabel(),
     pole: state.polePx ? imgToMeters([state.polePx], state.mPerPx)[0] : null,
   });
   const date = new Date().toISOString().slice(0, 10);
-  downloadDxf(`solar_layout_${result.pattern}_${date}.dxf`, dxf);
-  status(`DXFを出力しました（${patternLabel(result)}${includeStr ? " + 結線" : ""}）。`);
+  downloadDxf(`solar_layout_${date}.dxf`, dxf);
+  status(`DXFを出力しました（${state.zones.filter((z) => z.result).length}区画${includeStr ? " + 結線" : ""}）。`);
 });
 
-// ========== 9. 配管 ==========
-// パワコン位置の指定（複数台。クリックごとに追加）
+// ========== 9. 結線 ==========
 el("pccStart").addEventListener("click", () => {
   if (!state.loaded) return status("先に敷地図を読み込んでください。");
   state.mode = "pcc";
   status("パワコン位置を図面上でクリックしてください（複数台は続けてクリック）。");
 });
-// パワコン追加完了
 el("pccDone").addEventListener("click", () => {
   state.mode = "idle";
   updatePccStatus();
   status(`パワコン ${state.pccList.length}台で確定しました。`);
 });
-// パワコンをすべてクリア
 el("pccClear").addEventListener("click", () => {
   state.pccList = [];
   state.mode = "idle";
@@ -717,7 +1113,6 @@ el("pccClear").addEventListener("click", () => {
   status("パワコンをクリアしました。");
 });
 
-// 先方柱の指定／クリア
 el("poleStart").addEventListener("click", () => {
   if (!state.loaded) return status("先に敷地図を読み込んでください。");
   state.mode = "pole";
@@ -736,21 +1131,18 @@ function moduleLabel(): string | null {
   return s ? s : null;
 }
 
-// ストリング結線を生成（アレイ内完結優先・蛇行・PCS別色分け）
 el("pipeGenerate").addEventListener("click", () => {
-  if (!state.results || !state.results[state.previewIdx])
-    return status("先にパネル配置を生成してください（結線はプレビュー中の配置に対して引きます）。");
+  const layout = combinedResult();
+  if (!layout) return status("先にパネル配置を生成してください。");
   if (state.mPerPx <= 0) return status("縮尺が未校正です。");
   if (state.pccList.length === 0) return status("パワコン位置を1台以上指定してください。");
 
-  // px → 数学m。PCSは諸元つき。
   const pccs: PcsUnit[] = state.pccList.map((u) => ({
     pos: imgToMeters([u.px], state.mPerPx)[0],
     ns: u.ns,
     np: u.np,
     mppt: u.mppt,
   }));
-  const layout = state.results[state.previewIdx];
 
   state.stringing = generateStringing({ layout, pccs });
   showStringingResults();
@@ -788,9 +1180,8 @@ function showStringingResults() {
 
 // ---------- 10. PDF出力 ----------
 el("exportPdf").addEventListener("click", async () => {
-  if (!state.results || !state.results[state.previewIdx])
-    return status("先にパネル配置を生成してください。");
-  const result = state.results[state.previewIdx];
+  const result = combinedResult();
+  if (!result) return status("先にパネル配置を生成してください。");
   const includeStr =
     !!(document.getElementById("pdfIncludePipe") as HTMLInputElement)?.checked && !!state.stringing;
   status("PDFを生成中...");
@@ -799,17 +1190,17 @@ el("exportPdf").addEventListener("click", async () => {
     await buildAndDownloadPdf(
       {
         background: view.imageCanvas,
-        sitePolyPx: state.polyPts,
+        sitePolysPx: allSitePolysPx(),
         result,
         stringing: includeStr ? state.stringing : null,
-        fenceM: state.fencePolyM,
-        fenceLengthM: state.fenceLengthM,
+        fencesM: allFencesM(),
+        fenceLengthM: totalFenceLengthM(),
         moduleLabel: moduleLabel(),
         poleM: state.polePx ? imgToMeters([state.polePx], state.mPerPx)[0] : null,
         mPerPx: state.mPerPx,
-        title: `太陽光配置図 ${patternLabel(result)}${includeStr ? " + ストリング結線" : ""}  ${date}`,
+        title: `太陽光配置図（${state.zones.filter((z) => z.result).length}区画）${includeStr ? " + ストリング結線" : ""}  ${date}`,
       },
-      `solar_plan_${result.pattern}_${date}.pdf`
+      `solar_plan_${date}.pdf`
     );
     status("PDFを出力しました。");
   } catch (err) {
@@ -818,24 +1209,16 @@ el("exportPdf").addEventListener("click", async () => {
 });
 
 // ========== 11. プロジェクト保存／再開 ==========
-// 背景画像・校正・敷地・入力条件・PCSを1つのJSONに保存し、後日読み込んで編集を再開する。
-
-/** 保存対象の input / select の id（画面の入力条件すべて） */
 const PROJ_INPUT_IDS = [
-  // 校正
   "calibMethod", "calibDist", "calibUnit",
   "ref1x", "ref1y", "ref2x", "ref2y", "jprZone",
-  // 設置場所
   "address", "lat", "lon",
-  // パネル仕様
   "pMaker", "pModel", "pW", "pH", "pWatt",
-  // 配置の制約
-  "mountType", "orientation", "tiers", "colMode", "maxCols",
+  "mountType", "orientation", "rackDir", "tiers", "colMode", "maxCols",
   "spec1", "spec2", "spec3",
   "tilt", "setback", "colGap", "sideGap", "northAngle", "manualPitch",
   "roofRowGap", "flushSetbackEW", "flushSetbackNS", "flushRows", "flushCols",
-  "mountainGap",
-  // 結線
+  "mountainGap", "groundPattern",
   "defNs", "defNp", "defMppt",
 ];
 const PROJ_CHECK_IDS = ["dxfIncludePipe", "pdfIncludePipe"];
@@ -851,16 +1234,21 @@ function gatherProject(): ProjectData {
     const e = document.getElementById(id) as HTMLInputElement | null;
     if (e) checks[id] = e.checked;
   }
+  const zones: SavedZone[] = state.zones.map((z) => ({
+    polyPts: z.polyPts,
+    polyClosed: z.polyClosed,
+    manual: z.manual,
+    deleted: z.deleted,
+  }));
   return {
-    version: 1,
+    version: 2,
     savedAt: new Date().toISOString(),
     imageDataUrl: view.imageCanvas ? bitmapToDataUrl(view.imageCanvas) : null,
     imageFileName: state.imageName,
     mPerPx: state.mPerPx,
     lat: Number.isFinite(state.lat) ? state.lat : null,
     lon: Number.isFinite(state.lon) ? state.lon : null,
-    polyPts: state.polyPts,
-    polyClosed: state.polyClosed,
+    zones,
     pccList: state.pccList,
     polePx: state.polePx,
     inputs,
@@ -869,7 +1257,6 @@ function gatherProject(): ProjectData {
 }
 
 async function applyProject(data: ProjectData) {
-  // 背景画像
   if (data.imageDataUrl) {
     const img = await loadImageFromDataUrl(data.imageDataUrl, data.imageFileName || "(保存済み画像)");
     view.setImage(img);
@@ -877,7 +1264,6 @@ async function applyProject(data: ProjectData) {
     state.imageName = img.fileName;
     el("loadStatus").innerHTML = `<span class="ok">プロジェクトから復元: ${img.fileName} (${img.width}×${img.height}px)</span>`;
   }
-  // 入力欄
   for (const [id, val] of Object.entries(data.inputs)) {
     const e = document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
     if (e) e.value = val;
@@ -886,41 +1272,50 @@ async function applyProject(data: ProjectData) {
     const e = document.getElementById(id) as HTMLInputElement | null;
     if (e) e.checked = on;
   }
-  // 表示切替（設置タイプ・列数モード・校正方法）を入力値に追従させる
   sel("mountType").dispatchEvent(new Event("change"));
   sel("colMode").dispatchEvent(new Event("change"));
   sel("calibMethod").dispatchEvent(new Event("change"));
-  // 状態
+
   state.mPerPx = data.mPerPx || 0;
   state.lat = data.lat ?? NaN;
   state.lon = data.lon ?? NaN;
-  state.polyPts = data.polyPts ?? [];
-  state.polyClosed = !!data.polyClosed;
+  // 区画の復元：v2 は zones、v1（旧）は単一 polyPts を1区画へ変換
+  if (data.zones && data.zones.length > 0) {
+    state.zones = data.zones.map((sz) => {
+      const z = newZone();
+      z.polyPts = sz.polyPts ?? [];
+      z.polyClosed = !!sz.polyClosed;
+      z.manual = sz.manual ?? [];
+      z.deleted = sz.deleted ?? [];
+      return z;
+    });
+  } else if (data.polyPts && data.polyPts.length > 0) {
+    const z = newZone();
+    z.polyPts = data.polyPts;
+    z.polyClosed = !!data.polyClosed;
+    state.zones = [z];
+  } else {
+    state.zones = [];
+  }
+  state.activeZoneIdx = state.zones.length - 1;
   state.pccList = data.pccList ?? [];
   state.polePx = data.polePx ?? null;
   state.calibPts = [];
   state.korefPts = [];
-  // 生成物はクリア（条件から再生成してもらう）
-  state.results = null;
   state.stringing = null;
-  state.fencePolyM = null;
-  state.fenceLengthM = 0;
-  state.previewIdx = 0;
+  state.mode = "idle";
   el("results").innerHTML = "";
   el("pipeResults").innerHTML = "";
-  el("previewSeg").innerHTML = "";
-  (el("previewSeg") as HTMLElement).style.display = "none";
-  sel("exportPattern").innerHTML = "";
-  // ステータス表示
   el("calibStatus").innerHTML =
     state.mPerPx > 0
       ? `<span class="ok">校正済: ${(state.mPerPx * 1000).toFixed(2)} mm/px（プロジェクトから復元）</span>`
       : "未校正";
-  updatePolyStatus();
+  renderZoneList();
   updatePccStatus();
   renderPccList();
+  setManualButtons();
   view.render();
-  status("プロジェクトを読み込みました。条件を調整して「配置を生成」を押すと再生成できます。");
+  status("プロジェクトを読み込みました。「配置を生成」を押すと各区画を再配置します（手動追加パネルは保持されます）。");
 }
 
 el("projSave").addEventListener("click", () => {
@@ -940,6 +1335,9 @@ inp("projLoad").addEventListener("change", async (e) => {
   } catch (err) {
     status(`<span class="err">読み込みエラー: ${(err as Error).message}</span>`);
   } finally {
-    (e.target as HTMLInputElement).value = ""; // 同じファイルの再選択を可能に
+    (e.target as HTMLInputElement).value = "";
   }
 });
+
+// 初期表示
+renderZoneList();

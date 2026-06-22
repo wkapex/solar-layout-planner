@@ -51,12 +51,12 @@ function layerTable(buf: string[], pcsCount: number) {
 }
 
 export function buildDxf(
-  siteM: Vec2[],
+  sitesM: Vec2[][],
   result: LayoutResult,
   opts: {
     northAngleDeg: number;
     stringing?: StringingResult;
-    fence?: Vec2[] | null;
+    fences?: (Vec2[] | null)[];
     fenceLengthM?: number;
     moduleLabel?: string | null;
     pole?: Vec2 | null;
@@ -75,14 +75,16 @@ export function buildDxf(
   buf.push("0", "ENDSEC");
   buf.push("0", "SECTION", "2", "ENTITIES");
 
-  // 敷地外形（オレンジ/黄）
-  for (let i = 0; i < siteM.length; i++) {
-    line(buf, "SITE", siteM[i], siteM[(i + 1) % siteM.length]);
+  // 敷地外形（オレンジ/黄）。区画ごとに閉ポリゴンを描く。
+  for (const siteM of sitesM) {
+    for (let i = 0; i < siteM.length; i++) {
+      line(buf, "SITE", siteM[i], siteM[(i + 1) % siteM.length]);
+    }
   }
 
-  // フェンスライン（緑・野立てのみ）。境界離隔ぶん内側の閉ポリゴン。
-  if (opts.fence && opts.fence.length >= 2) {
-    const f = opts.fence;
+  // フェンスライン（緑・野立てのみ）。境界離隔ぶん内側の閉ポリゴン・区画ごと。
+  for (const f of opts.fences ?? []) {
+    if (!f || f.length < 2) continue;
     for (let i = 0; i < f.length; i++) line(buf, "FENCE", f[i], f[(i + 1) % f.length]);
   }
 
@@ -93,9 +95,10 @@ export function buildDxf(
     }
   }
 
-  // バウンディングボックス（注記・方位マーク・文字サイズ用）
-  const xs = siteM.map((p) => p.x);
-  const ys = siteM.map((p) => p.y);
+  // バウンディングボックス（注記・方位マーク・文字サイズ用）。全区画の頂点から。
+  const allSitePts = sitesM.flat();
+  const xs = allSitePts.map((p) => p.x);
+  const ys = allSitePts.map((p) => p.y);
   const minX = Math.min(...xs), maxX = Math.max(...xs);
   const minY = Math.min(...ys), maxY = Math.max(...ys);
   const diag = Math.hypot(maxX - minX, maxY - minY);
@@ -238,7 +241,7 @@ export function buildDxf(
   if (result.arrays.length > 0) put(`ARRAYS: ${arrayComposition(result)}`);
   if (result.mountType === "tilted")
     put(`ARRAY GAP(N-S) = ${Math.max(0, result.pitchM - result.groundDepthM).toFixed(2)} m`);
-  if (opts.fence && opts.fenceLengthM && opts.fenceLengthM > 0)
+  if (opts.fenceLengthM && opts.fenceLengthM > 0)
     put(`FENCE LENGTH = ${opts.fenceLengthM.toFixed(1)} m`);
   // 設置角度（真南=0度・東西の振れ）。パターンB(土地なり)で意味を持つ。
   if (result.pattern === "B") {

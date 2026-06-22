@@ -47,6 +47,7 @@
         border-radius: 5px; cursor: pointer; margin-top: 8px;
       }
       button.secondary { background: #44444f; }
+      button.active-mode { background: #16a34a; }
       button:hover { filter: brightness(1.1); }
       .hint { font-size: 11px; color: #8a8a96; margin-top: 4px; }
       .ok { color: #5ad17f; } .warn { color: #f0c14b; } .err { color: #f06a6a; }
@@ -128,15 +129,16 @@
           </div>
         </details>
 
-        <details>
-          <summary>3. 敷地を多角形で囲む</summary>
+        <details open>
+          <summary>3. 区画を囲む（複数可）</summary>
           <div class="body">
-            <button id="polyStart" class="secondary">作図開始（クリックで頂点追加）</button>
+            <button id="zoneAdd">区画を追加（クリックで頂点）</button>
             <div class="row">
               <button id="polyUndo" class="secondary">1点戻す</button>
-              <button id="polyClose">閉じる</button>
+              <button id="polyClose">この区画を閉じる</button>
             </div>
-            <div id="polyStatus" class="hint">未作図</div>
+            <div class="hint">配置したい場所が複数あるときは、区画ごとに「区画を追加」→囲む→「この区画を閉じる」を繰り返します。一覧で区画を選ぶと、その区画が編集対象になります。</div>
+            <div id="zoneList" style="margin-top:6px"></div>
           </div>
         </details>
 
@@ -183,7 +185,15 @@
             </select>
             <div id="mountHint" class="hint">野立て：傾斜角＋冬至の影離隔で配置（A=真南／B=敷地なり）。</div>
 
-            <div class="row">
+            <div id="groundPatternBox">
+              <label>野立ての配置案（全区画に適用）</label>
+              <select id="groundPattern">
+                <option value="B">敷地なり（最大枚数）</option>
+                <option value="A">真南設置</option>
+              </select>
+            </div>
+
+            <div class="row" id="orientTierRow">
               <div><label>パネルの向き</label>
                 <select id="orientation"><option value="portrait">縦置き</option><option value="landscape">横置き</option></select>
               </div>
@@ -233,8 +243,13 @@
               <div class="hint">傾斜屋根は<b>常に横置き</b>・影離隔なしの均一グリッドで、東西の列が揃う最大矩形を自動配置します。</div>
             </div>
             <div id="roofRackBox" style="display:none">
+              <label>合掌の向き</label>
+              <select id="rackDir">
+                <option value="ew">東西向き（東西に傾斜・棟は南北）</option>
+                <option value="ns">南北向き（南北に傾斜・棟は東西）</option>
+              </select>
               <label>山と山の離隔(m/陸屋根・合掌)</label><input type="number" id="mountainGap" value="0.25" step="0.05" />
-              <div class="hint">陸屋根は合掌（東西・背中合わせ）の山型配置。横の列間は「列内ギャップ」を使用。</div>
+              <div class="hint">陸屋根は常に横置きの合掌（背中合わせ）の山型配置。向きは「合掌の向き」で切替（南北向き＝東西向きを90度回転）。横の列間は「列内ギャップ」を使用。</div>
             </div>
           </div>
         </details>
@@ -242,11 +257,23 @@
         <details open>
           <summary>7. 配置を生成</summary>
           <div class="body">
-            <button id="generateBtn">2パターンを生成</button>
+            <button id="generateBtn">配置を生成（全区画）</button>
+            <div class="hint">閉じた区画すべてを、共通設定でまとめて自動配置します。</div>
             <div id="results"></div>
-            <div class="seg" id="previewSeg" style="display:none">
-              <button data-p="A" class="active">Aを表示</button>
-              <button data-p="B">Bを表示</button>
+          </div>
+        </details>
+
+        <details open>
+          <summary>7.5 手動でパネル調整</summary>
+          <div class="body">
+            <div class="hint">配置を生成したあと、<b>一覧で対象区画を選択</b>してから、空き部分にパネルを足したり不要なパネルを消せます（クリックで1枚ずつ）。</div>
+            <div class="row">
+              <button id="panelAddMode" class="secondary">パネル追加モード</button>
+              <button id="panelDelMode" class="secondary">パネル削除モード</button>
+            </div>
+            <div class="row">
+              <button id="manualDone" class="secondary">編集を終了</button>
+              <button id="manualReset" class="secondary">この区画の手動編集をリセット</button>
             </div>
           </div>
         </details>
@@ -286,8 +313,6 @@
         <details open>
           <summary>9. DXF / PDF 出力</summary>
           <div class="body">
-            <label>DXF出力パターン</label>
-            <select id="exportPattern"></select>
             <div class="chk">
               <input type="checkbox" id="dxfIncludePipe" checked />
               <label>ストリング結線を含める（プレビュー中の案）</label>
