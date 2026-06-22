@@ -143,7 +143,12 @@
               <button id="refEdgeStart" class="secondary">基準辺を選択</button>
               <button id="refEdgeClear" class="secondary">基準辺クリア</button>
             </div>
-            <div class="hint">屋根の角が直角でなく配置がズレる場合：選択中の区画の枠線を1本クリックすると、その辺にパネル列を平行（反対側は厳密に90度）に配置します。基準辺はシアンで表示。屋根モード（陸屋根・傾斜屋根）で有効。</div>
+            <label>基準辺との関係（選択中の区画）</label>
+            <select id="refEdgeRel">
+              <option value="parallel">辺に平行（パネル列が辺に沿う）</option>
+              <option value="perp">辺に垂直（パネル列が辺に直交）</option>
+            </select>
+            <div class="hint">屋根の角が直角でなく配置がズレる場合：選択中の区画の枠線を1本クリックすると基準辺になり、その辺に「平行」または「垂直」にパネル列を揃えます（もう一方は厳密に90度）。基準辺はシアンで表示。屋根モード（陸屋根・傾斜屋根）で有効。</div>
           </div>
         </details>
 
@@ -189,14 +194,6 @@
               <option value="roof_flush">傾斜屋根（パネルを寝かせてフラッシュ設置）</option>
             </select>
             <div id="mountHint" class="hint">野立て：傾斜角＋冬至の影離隔で配置（A=真南／B=敷地なり）。</div>
-
-            <div id="groundPatternBox">
-              <label>野立ての配置案（全区画に適用）</label>
-              <select id="groundPattern">
-                <option value="B">敷地なり（最大枚数）</option>
-                <option value="A">真南設置</option>
-              </select>
-            </div>
 
             <div class="row" id="orientTierRow">
               <div><label>パネルの向き</label>
@@ -268,6 +265,13 @@
         <details open>
           <summary>7. 配置を生成</summary>
           <div class="body">
+            <div id="groundPatternBox">
+              <label>野立ての配置案（全区画に適用）</label>
+              <select id="groundPattern">
+                <option value="B">敷地なり（最大枚数）</option>
+                <option value="A">真南設置</option>
+              </select>
+            </div>
             <button id="generateBtn">配置を生成（全区画）</button>
             <div class="hint">閉じた区画すべてを、共通設定でまとめて自動配置します。</div>
             <div id="results"></div>

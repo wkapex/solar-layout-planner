@@ -68,7 +68,8 @@ interface Zone {
   deleted: string[]; // 削除キー（自動="a{ai}_{pi}" / 手動="m{idx}"）
   fenceM: Vec2[] | null; // フェンスライン（数学m・野立てのみ）
   fenceLengthM: number; // フェンス延長(周長, m)
-  refEdgeIdx: number | null; // 基準辺（多角形の辺番号）。設定時はこの辺に平行配置する
+  refEdgeIdx: number | null; // 基準辺（多角形の辺番号）。設定時はこの辺に配置を合わせる
+  refEdgePerp: boolean; // 基準辺に対して true=垂直 / false=平行
 }
 
 function newZone(): Zone {
@@ -82,6 +83,7 @@ function newZone(): Zone {
     fenceM: null,
     fenceLengthM: 0,
     refEdgeIdx: null,
+    refEdgePerp: false,
   };
 }
 
@@ -624,6 +626,7 @@ el("zoneAdd").addEventListener("click", () => {
   state.zones.push(newZone());
   state.activeZoneIdx = state.zones.length - 1;
   state.mode = "poly";
+  syncRefEdgeRel();
   renderZoneList();
   view.render();
   status(`区画${state.zones.length}を作図中。クリックで頂点を追加し、「この区画を閉じる」を押してください。`);
@@ -655,6 +658,20 @@ el("refEdgeClear").addEventListener("click", () => {
   view.render();
   status("基準辺をクリアしました（屋根なり自動に戻ります）。");
 });
+// 基準辺との関係（平行/垂直）。選択中の区画に適用する。
+sel("refEdgeRel").addEventListener("change", () => {
+  const z = activeZone();
+  if (!z) return;
+  z.refEdgePerp = sel("refEdgeRel").value === "perp";
+  if (z.refEdgeIdx != null)
+    status(`基準辺との関係を「${z.refEdgePerp ? "垂直" : "平行"}」にしました。「配置を生成」で反映。`);
+});
+
+/** 「基準辺との関係」セレクトを、選択中の区画の状態に同期する */
+function syncRefEdgeRel() {
+  const z = activeZone();
+  sel("refEdgeRel").value = z && z.refEdgePerp ? "perp" : "parallel";
+}
 
 el("polyClose").addEventListener("click", () => {
   const z = activeZone();
@@ -705,6 +722,7 @@ function renderZoneList() {
   host.querySelectorAll<HTMLButtonElement>("button[data-sel]").forEach((b) => {
     b.addEventListener("click", () => {
       state.activeZoneIdx = parseInt(b.dataset.sel!);
+      syncRefEdgeRel();
       renderZoneList();
       view.render();
       status(`区画${state.activeZoneIdx + 1}を選択しました。`);
@@ -906,7 +924,9 @@ el("generateBtn").addEventListener("click", () => {
         const pm = zonePolyM(z);
         const a = pm[z.refEdgeIdx!];
         const b = pm[(z.refEdgeIdx! + 1) % pm.length];
-        input.forcedFacing = facingParallelToEdge(sub(b, a), northDeg);
+        let f = facingParallelToEdge(sub(b, a), northDeg);
+        if (z.refEdgePerp) f = (f + 90) % 360; // 辺に垂直（列方向を90度回す）
+        input.forcedFacing = f;
       } else if (mountType === "rack" && unifiedFacing != null) {
         input.forcedFacing = unifiedFacing;
       }
@@ -1322,6 +1342,7 @@ function gatherProject(): ProjectData {
     manual: z.manual,
     deleted: z.deleted,
     refEdgeIdx: z.refEdgeIdx,
+    refEdgePerp: z.refEdgePerp,
   }));
   return {
     version: 2,
@@ -1371,6 +1392,7 @@ async function applyProject(data: ProjectData) {
       z.manual = sz.manual ?? [];
       z.deleted = sz.deleted ?? [];
       z.refEdgeIdx = sz.refEdgeIdx ?? null;
+      z.refEdgePerp = !!sz.refEdgePerp;
       return z;
     });
   } else if (data.polyPts && data.polyPts.length > 0) {
@@ -1398,6 +1420,7 @@ async function applyProject(data: ProjectData) {
   updatePccStatus();
   renderPccList();
   setManualButtons();
+  syncRefEdgeRel();
   view.render();
   status("プロジェクトを読み込みました。「配置を生成」を押すと各区画を再配置します（手動追加パネルは保持されます）。");
 }
