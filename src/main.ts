@@ -851,9 +851,10 @@ el("generateBtn").addEventListener("click", () => {
   setTimeout(() => {
     const targets = state.zones.filter((z) => z.polyClosed && z.polyPts.length >= 3);
     const inputs = targets.map((z) => buildLayoutInput(zonePolyM(z), sun));
-    // 複数区画の陸屋根は、東西の振れ（合掌の向き）を全区画で統一する。
+    // 複数区画の陸屋根は、既定では「区画ごと（屋根なり）」。
+    // 「全区画で統一」を選んだ場合のみ、東西の振れ（合掌の向き）を全区画で統一する。
     let unifiedFacing: number | null = null;
-    if (mountType === "rack" && inputs.length > 1) {
+    if (mountType === "rack" && inputs.length > 1 && sel("rackUnify").value === "unify") {
       unifiedFacing = unifiedRackFacing(inputs);
     }
     targets.forEach((z, i) => {
@@ -928,14 +929,20 @@ function refreshResultsSummary() {
       `</div>`;
   });
   const totalKw = (totalPanels * watt) / 1000;
-  // 全区画の配置角度が一致しているかチェック（東西の振れ統一の確認）
+  // 配置角度の表示。「全区画で統一」選択時だけ一致チェック（✓/⚠）、
+  // 既定（区画ごと=屋根なり）では区画ごとに角度が異なるのが正常なので中立表示にする。
   let angleLine = "";
   if (devs.length > 1) {
     const span = Math.max(...devs) - Math.min(...devs);
-    angleLine =
-      span < 0.05
-        ? `<div class="ok">東西の振れ: 全区画一致 ✓（基準から${devs[0] >= 0 ? "+" : ""}${devs[0].toFixed(1)}°）</div>`
-        : `<div class="warn">⚠ 区画間で配置角度が異なります（差 ${span.toFixed(1)}°）</div>`;
+    const unified = engineMountType() === "rack" && sel("rackUnify").value === "unify";
+    if (unified) {
+      angleLine =
+        span < 0.05
+          ? `<div class="ok">東西の振れ: 全区画一致 ✓（基準から${devs[0] >= 0 ? "+" : ""}${devs[0].toFixed(1)}°）</div>`
+          : `<div class="warn">⚠ 統一が効いていません（差 ${span.toFixed(1)}°）。再生成してください。</div>`;
+    } else {
+      angleLine = `<div class="hint">配置角度は区画ごと（屋根なり）。各区画は自分の屋根の辺に沿って配置しています。</div>`;
+    }
   }
   const head =
     `<div class="result-card" style="border-color:#3a6df0">` +
@@ -1060,8 +1067,8 @@ function snapPanelRect(g: LayoutGrid, click: Vec2, polyM: Vec2[]): Vec2[] | null
     }
   }
   if (!best) return null;
-  const pts = [...best.rect, centroid(best.rect)];
-  if (!pts.every((pt) => pointInPolygon(pt, polyM))) return null;
+  // 手動追加は「セル中心が区画内」なら許可（端の列をそろえやすくする。多少のはみ出しは手動判断に委ねる）。
+  if (!pointInPolygon(centroid(best.rect), polyM)) return null;
   return best.rect;
 }
 
@@ -1214,7 +1221,7 @@ const PROJ_INPUT_IDS = [
   "ref1x", "ref1y", "ref2x", "ref2y", "jprZone",
   "address", "lat", "lon",
   "pMaker", "pModel", "pW", "pH", "pWatt",
-  "mountType", "orientation", "rackDir", "tiers", "colMode", "maxCols",
+  "mountType", "orientation", "rackDir", "rackUnify", "tiers", "colMode", "maxCols",
   "spec1", "spec2", "spec3",
   "tilt", "setback", "colGap", "sideGap", "northAngle", "manualPitch",
   "roofRowGap", "flushSetbackEW", "flushSetbackNS", "flushRows", "flushCols",
