@@ -15,6 +15,7 @@ import {
   layoutRoofSingle,
   layoutFlushRoof,
   unifiedRackFacing,
+  facingParallelToEdge,
   LayoutInput,
   LayoutResult,
   LayoutGrid,
@@ -33,6 +34,7 @@ import {
   dot,
   normalize,
   pointInPolygon,
+  distPointToSegment,
 } from "./geometry";
 import {
   generateStringing,
@@ -54,7 +56,7 @@ const inp = (id: string) => document.getElementById(id) as HTMLInputElement;
 const sel = (id: string) => document.getElementById(id) as HTMLSelectElement;
 const el = (id: string) => document.getElementById(id)!;
 
-type Mode = "idle" | "calib" | "poly" | "koref" | "pcc" | "pole" | "padd" | "pdel";
+type Mode = "idle" | "calib" | "poly" | "koref" | "pcc" | "pole" | "padd" | "pdel" | "refedge";
 
 /** 1区画＝1つの敷地（屋根）多角形＋その自動配置結果＋手動編集 */
 interface Zone {
@@ -66,6 +68,7 @@ interface Zone {
   deleted: string[]; // 削除キー（自動="a{ai}_{pi}" / 手動="m{idx}"）
   fenceM: Vec2[] | null; // フェンスライン（数学m・野立てのみ）
   fenceLengthM: number; // フェンス延長(周長, m)
+  refEdgeIdx: number | null; // 基準辺（多角形の辺番号）。設定時はこの辺に平行配置する
 }
 
 function newZone(): Zone {
@@ -78,6 +81,7 @@ function newZone(): Zone {
     deleted: [],
     fenceM: null,
     fenceLengthM: 0,
+    refEdgeIdx: null,
   };
 }
 
@@ -345,6 +349,17 @@ view.onOverlay = (ctx) => {
       ctx.arc(p.x, p.y, 4 / s, 0, Math.PI * 2);
       ctx.fill();
     }
+    // 基準辺のハイライト（シアン）。配置はこの辺に平行に作られる。
+    if (z.polyClosed && z.refEdgeIdx != null && z.refEdgeIdx < z.polyPts.length) {
+      const a = z.polyPts[z.refEdgeIdx];
+      const b = z.polyPts[(z.refEdgeIdx + 1) % z.polyPts.length];
+      ctx.strokeStyle = "#22d3ee";
+      ctx.lineWidth = lw * 2.6;
+      ctx.beginPath();
+      ctx.moveTo(a.x, a.y);
+      ctx.lineTo(b.x, b.y);
+      ctx.stroke();
+    }
     // 区画番号ラベル
     if (z.polyPts.length > 0) {
       const c = centroid(z.polyPts);
@@ -415,13 +430,16 @@ view.onClick = (p: ImgPoint) => {
     const z = activeZone();
     if (!z) return;
     if (z.polyClosed) {
-      // 閉合済みの区画に再クリック＝この区画を引き直す
+      // 閉合済みの区画に再クリック＝この区画を引き直す（基準辺もリセット）
       z.polyPts = [];
       z.polyClosed = false;
+      z.refEdgeIdx = null;
     }
     z.polyPts.push(p);
     renderZoneList();
     view.render();
+  } else if (state.mode === "refedge") {
+    handleSelectRefEdge(p);
   } else if (state.mode === "pcc") {
     state.pccList.push({ px: p, ...defaultPccSpec() });
     updatePccStatus();
@@ -616,8 +634,26 @@ el("polyUndo").addEventListener("click", () => {
   if (!z) return;
   z.polyPts.pop();
   z.polyClosed = false;
+  z.refEdgeIdx = null;
   renderZoneList();
   view.render();
+});
+
+// 基準辺の選択／クリア（選択中の区画の枠線を1本クリックして向きを決める）
+el("refEdgeStart").addEventListener("click", () => {
+  const z = activeZone();
+  if (!z || !z.polyClosed) return status("先に対象区画を一覧で選び、閉じてください。");
+  state.mode = "refedge";
+  status(`区画${state.activeZoneIdx + 1}の枠線を1本クリックして基準辺を選んでください（その辺にパネル列を平行にします）。`);
+});
+el("refEdgeClear").addEventListener("click", () => {
+  const z = activeZone();
+  if (!z) return;
+  z.refEdgeIdx = null;
+  if (state.mode === "refedge") state.mode = "idle";
+  renderZoneList();
+  view.render();
+  status("基準辺をクリアしました（屋根なり自動に戻ります）。");
 });
 
 el("polyClose").addEventListener("click", () => {
@@ -656,6 +692,7 @@ function renderZoneList() {
         info += ` / ${area.toLocaleString(undefined, { maximumFractionDigits: 0 })}m²`;
       }
       if (z.result) info += ` / ${cnt}枚`;
+      if (z.refEdgeIdx != null) info += " / 基準辺✓";
       return (
         `<div style="display:flex;align-items:center;gap:6px;margin:3px 0;padding:3px 5px;border-radius:4px;${active ? "background:#2d3a66" : ""}">` +
         `<button data-sel="${i}" class="secondary" style="flex:1;text-align:left;margin:0;padding:3px 6px;font-size:12px">` +
@@ -857,9 +894,22 @@ el("generateBtn").addEventListener("click", () => {
     if (mountType === "rack" && inputs.length > 1 && sel("rackUnify").value === "unify") {
       unifiedFacing = unifiedRackFacing(inputs);
     }
+    const northDeg = parseFloat(inp("northAngle").value) || 0;
     targets.forEach((z, i) => {
       const input = inputs[i];
-      if (mountType === "rack" && unifiedFacing != null) input.forcedFacing = unifiedFacing;
+      // 屋根モードで基準辺が設定されていれば最優先（その辺に平行配置）。次に全区画統一。
+      const useRefEdge =
+        (mountType === "rack" || mountType === "flush") &&
+        z.refEdgeIdx != null &&
+        z.refEdgeIdx < z.polyPts.length;
+      if (useRefEdge) {
+        const pm = zonePolyM(z);
+        const a = pm[z.refEdgeIdx!];
+        const b = pm[(z.refEdgeIdx! + 1) % pm.length];
+        input.forcedFacing = facingParallelToEdge(sub(b, a), northDeg);
+      } else if (mountType === "rack" && unifiedFacing != null) {
+        input.forcedFacing = unifiedFacing;
+      }
       const res =
         mountType === "tilted"
           ? groundPat === "A"
@@ -1018,6 +1068,31 @@ function handleDeletePanel(p: ImgPoint) {
   if (!z.deleted.includes(key)) z.deleted.push(key);
   onPanelsChanged();
   status(`区画${state.activeZoneIdx + 1}のパネルを削除（計${zonePanelCount(z)}枚）。続けてクリックで削除。`);
+}
+
+/** クリック地点に最も近い区画の辺を基準辺に設定する */
+function handleSelectRefEdge(p: ImgPoint) {
+  const z = activeZone();
+  if (!z || !z.polyClosed || z.polyPts.length < 3)
+    return status("先に対象区画を閉じてから基準辺を選んでください。");
+  let best = -1;
+  let bestD = Infinity;
+  for (let i = 0; i < z.polyPts.length; i++) {
+    const a = z.polyPts[i];
+    const b = z.polyPts[(i + 1) % z.polyPts.length];
+    const d = distPointToSegment(p, a, b);
+    if (d < bestD) {
+      bestD = d;
+      best = i;
+    }
+  }
+  z.refEdgeIdx = best;
+  state.mode = "idle";
+  renderZoneList();
+  view.render();
+  status(
+    `区画${state.activeZoneIdx + 1}の基準辺を設定しました（シアンの辺）。配置はこの辺に平行になります。「配置を生成」で反映。`
+  );
 }
 
 /** クリック地点にあるパネルのキー（"a{ai}_{pi}" / "m{idx}"）を返す */
@@ -1246,6 +1321,7 @@ function gatherProject(): ProjectData {
     polyClosed: z.polyClosed,
     manual: z.manual,
     deleted: z.deleted,
+    refEdgeIdx: z.refEdgeIdx,
   }));
   return {
     version: 2,
@@ -1294,6 +1370,7 @@ async function applyProject(data: ProjectData) {
       z.polyClosed = !!sz.polyClosed;
       z.manual = sz.manual ?? [];
       z.deleted = sz.deleted ?? [];
+      z.refEdgeIdx = sz.refEdgeIdx ?? null;
       return z;
     });
   } else if (data.polyPts && data.polyPts.length > 0) {

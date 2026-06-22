@@ -410,6 +410,9 @@ function candidateFacingsFromEdges(input: LayoutInput): number[] {
 
 /** パターンB：敷地の辺方向に沿った向きの中から総枚数最大を採用（同数なら南に近い向き） */
 export function layoutPatternB(input: LayoutInput): LayoutResult {
+  // 基準辺などで向きが固定されている場合はその向きで配置する。
+  if (input.forcedFacing != null)
+    return buildResult("B", input, input.forcedFacing, placeArrays(input, input.forcedFacing));
   let best: { facing: number; placed: ReturnType<typeof placeArrays>; panels: number } | null =
     null;
   for (const facing of candidateFacingsFromEdges(input)) {
@@ -440,6 +443,18 @@ function candidateFacingsRoof(input: LayoutInput): number[] {
   }
   if (set.size === 0) set.add(0);
   return [...set];
+}
+
+/**
+ * 基準辺（数学m方向ベクトル）に「列方向(u軸)を平行」にする facing を返す。
+ * これを forcedFacing に渡すと、選んだ辺にパネル列が平行・行方向は厳密に90度で配置される
+ * （多角形の角が直角でなくても、選んだ辺にはきっちり揃う）。
+ */
+export function facingParallelToEdge(edgeDirM: Vec2, northAngleDeg: number): number {
+  const { n, e } = basis(northAngleDeg);
+  const b = bearingOfVector(edgeDirM, n, e); // 辺方向の方位（北=0時計回り）
+  // uUnit = dirFromBearing(facing+90) を辺方向に一致させる → facing = 辺方位 - 90
+  return (((b - 90) % 360) + 360) % 360;
 }
 
 /**
@@ -570,6 +585,8 @@ export function layoutFlushRoof(input: LayoutInput): LayoutResult {
       ),
     ];
   }
+  // 基準辺などで向きが固定されている場合はその向きのみを採用する。
+  if (input.forcedFacing != null) facings = [input.forcedFacing];
 
   for (const facing of facings) {
     const uUnit = dirFromBearing(facing + 90, n, e);

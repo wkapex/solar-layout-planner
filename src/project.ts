@@ -11,6 +11,7 @@ export interface SavedZone {
   polyClosed: boolean;
   manual: Vec2[][]; // 手動追加パネル（数学m・4隅）
   deleted: string[]; // 削除キー（"a{ai}_{pi}" / "m{idx}"）
+  refEdgeIdx?: number | null; // 基準辺（多角形の辺番号）。設定時はこの辺に平行配置
 }
 
 export interface ProjectData {
